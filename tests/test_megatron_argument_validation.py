@@ -461,6 +461,27 @@ def test_weight_checker_skip_prefix_argument_is_repeatable(monkeypatch):
 
     assert defaults.weight_checker_skip_prefix == []
     assert configured.weight_checker_skip_prefix == ["visual.", "audio."]
+    assert defaults.weight_checker_frozen_prefix == []
+
+
+@pytest.mark.unit
+def test_weight_checker_frozen_prefix_argument_is_repeatable(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    module.get_slime_extra_args_provider()(parser)
+
+    configured = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--weight-checker-frozen-prefix",
+            "visual.",
+            "--weight-checker-frozen-prefix",
+            "audio.",
+        ]
+    )
+
+    assert configured.weight_checker_frozen_prefix == ["visual.", "audio."]
 
 
 if __name__ == "__main__":

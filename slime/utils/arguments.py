@@ -1334,6 +1334,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=[],
                 help="Skip a frozen SGLang parameter prefix during destructive weight-sync checks.",
             )
+            parser.add_argument(
+                "--weight-checker-frozen-prefix",
+                action="append",
+                default=[],
+                help="Require this SGLang parameter prefix to keep the same checksum for the whole run.",
+            )
             return parser
 
         def add_network_arguments(parser):

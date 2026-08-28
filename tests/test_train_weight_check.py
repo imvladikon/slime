@@ -63,3 +63,27 @@ def test_regular_weight_update_is_not_duplicated(monkeypatch):
     )
 
     assert events == [("actor", "update")]
+
+
+def test_frozen_weight_fingerprint_selects_only_requested_prefixes():
+    responses = [
+        {
+            "success": True,
+            "ranks": [
+                {
+                    "checksums": {
+                        "model.layers.0.weight": "language",
+                        "visual.blocks.0.weight": "vision-0",
+                        "visual.blocks.1.weight": "vision-1",
+                    }
+                }
+            ],
+        }
+    ]
+
+    assert train._frozen_weight_fingerprint(responses, ["visual."]) == (
+        (
+            ("visual.blocks.0.weight", "vision-0"),
+            ("visual.blocks.1.weight", "vision-1"),
+        ),
+    )

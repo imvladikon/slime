@@ -18,6 +18,38 @@ def _update_rollout_weights(args, actor_model, rollout_manager, *, refresh_snaps
     ray.get(rollout_manager.check_weights.remote(action="compare"))
 
 
+def _frozen_weight_fingerprint(responses, prefixes: list[str]):
+    """Select stable per-rank checksums for frozen rollout-only parameters."""
+    fingerprint = []
+    matched = 0
+    for engine_index, response in enumerate(responses):
+        if not response.get("success") or not response.get("ranks"):
+            raise RuntimeError(f"SGLang checksum failed for engine {engine_index}: {response}")
+        for rank in response["ranks"]:
+            selected = tuple(
+                sorted(
+                    (name, checksum)
+                    for name, checksum in rank["checksums"].items()
+                    if name.startswith(tuple(prefixes))
+                )
+            )
+            matched += len(selected)
+            fingerprint.append(selected)
+    if matched == 0:
+        raise RuntimeError(f"no SGLang weights matched frozen prefixes {prefixes}")
+    return tuple(fingerprint)
+
+
+def _checksum_frozen_weights(args, rollout_manager):
+    prefixes = args.weight_checker_frozen_prefix
+    if not prefixes or not args.check_weight_update_equal:
+        return None
+    responses = ray.get(
+        rollout_manager.check_weights.remote(action="checksum", skip_prefixes=[])
+    )
+    return _frozen_weight_fingerprint(responses, prefixes)
+
+
 def train(args):
     configure_logger()
     release_train = args.release_train
@@ -37,6 +69,7 @@ def train(args):
 
     # Always push actor weights to rollout once weights are loaded.
     _update_rollout_weights(args, actor_model, rollout_manager, refresh_snapshot=False)
+    frozen_weight_fingerprint = _checksum_frozen_weights(args, rollout_manager)
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
@@ -98,6 +131,11 @@ def train(args):
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
+
+    if frozen_weight_fingerprint is not None:
+        final_fingerprint = _checksum_frozen_weights(args, rollout_manager)
+        if final_fingerprint != frozen_weight_fingerprint:
+            raise RuntimeError("frozen SGLang rollout weights changed during training")
 
     ray.get(rollout_manager.dispose.remote())
     finish_tracking(args)
