@@ -338,8 +338,11 @@ class SGLangEngine(RayActor):
             {"tags": tags},
         )
 
-    def check_weights(self, action: str):
-        return self._make_request("weights_checker", {"action": action})
+    def check_weights(self, action: str, skip_prefixes: list[str] | None = None):
+        return self._make_request(
+            "weights_checker",
+            {"action": action, "skip_prefixes": skip_prefixes or []},
+        )
 
     def pull_weights(self, target_version: int):
         """Have the engine sync every host it spans to target_version: each host pulls the

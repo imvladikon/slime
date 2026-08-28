@@ -98,6 +98,7 @@ MODEL_ARGS=(
 
   --mtp-num-layers 0
   --freeze-indexer
+  --weight-checker-skip-prefix visual.
   --enable-experimental
 )
 

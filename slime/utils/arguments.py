@@ -1328,6 +1328,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             reset_arg(parser, "--record-memory-history", action="store_true", default=False)
             parser.add_argument("--check-weight-update-equal", action="store_true")
+            parser.add_argument(
+                "--weight-checker-skip-prefix",
+                action="append",
+                default=[],
+                help="Skip a frozen SGLang parameter prefix during destructive weight-sync checks.",
+            )
             return parser
 
         def add_network_arguments(parser):
