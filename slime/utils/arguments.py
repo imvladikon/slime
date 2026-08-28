@@ -120,6 +120,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Extra environment variables for training process, e.g. PyTorch memory management ones.",
             )
             parser.add_argument(
+                "--disable-distributed-optimizer",
+                action="store_true",
+                help="Use the local optimizer for single-rank lifecycle diagnostics.",
+            )
+            parser.add_argument(
                 "--force-fp8-ue8m0-scale",
                 action="store_true",
                 default=False,
