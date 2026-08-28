@@ -102,9 +102,9 @@ def convert_glm5_next_to_hf(args, name, param):
             or _HC_MAPPING.get(rest)
         )
         if suffix is not None:
-            # MCore deliberately trains the dynamic mHC projection in FP32,
-            # while both the released checkpoint and SGLang store hc_*_fn in
-            # the model parameter dtype.  Static bases/scales remain FP32.
+            # The GLM Megatron config stores the dynamic projection in the
+            # model dtype, matching the released checkpoint and SGLang.
+            # Keep this cast as an export invariant for older checkpoints.
             if rest.endswith("hyper_connection.mapping_proj.weight"):
                 param = param.to(getattr(args, "params_dtype", torch.bfloat16))
             return [(prefix + suffix, param)]

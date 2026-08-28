@@ -53,7 +53,7 @@ def _tiny_config(MLATransformerConfig):
         moe_router_score_function="sigmoid",
         moe_router_dtype="fp32",
         moe_router_enable_expert_bias=True,
-        moe_router_bias_update_rate=0.0,
+        moe_router_bias_update_rate=1e-3,
         moe_router_load_balancing_type="none",
         moe_router_num_groups=1,
         moe_router_group_topk=1,
@@ -69,6 +69,7 @@ def _tiny_config(MLATransformerConfig):
         mhc_num_residual_streams=4,
         mhc_sinkhorn_iterations=20,
         mhc_rms_epsilon_inside_sqrt=True,
+        mhc_mapping_proj_fp32=False,
         use_fused_mhc=False,
         mtp_num_layers=0,
     )

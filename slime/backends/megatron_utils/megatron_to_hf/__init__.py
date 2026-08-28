@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 from .deepseekv3 import convert_deepseekv3_to_hf
 from .glm4 import convert_glm4_to_hf
 from .glm4moe import convert_glm4moe_to_hf
@@ -29,6 +31,46 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None, trans
 
 # TODO optimize
 _cached_tensors = {}
+_conversion_scope_depth = 0
+
+
+def _clear_conversion_caches() -> None:
+    from .glm5_next import _HC_BUFFERS
+
+    _cached_tensors.clear()
+    _HC_BUFFERS.clear()
+
+
+def _assert_conversion_caches_empty() -> None:
+    from .glm5_next import _HC_BUFFERS
+
+    if _cached_tensors or _HC_BUFFERS:
+        raise RuntimeError(
+            "Megatron-to-HF conversion ended with incomplete paired tensors: "
+            f"projection_pairs={sorted(_cached_tensors)}, mhc_groups={sorted(_HC_BUFFERS)}"
+        )
+
+
+@contextmanager
+def conversion_cache_scope():
+    """Keep stateful tensor pairing local to one complete conversion iterator."""
+    global _conversion_scope_depth
+    outermost = _conversion_scope_depth == 0
+    if outermost:
+        _clear_conversion_caches()
+    _conversion_scope_depth += 1
+    completed = False
+    try:
+        yield
+        completed = True
+    finally:
+        _conversion_scope_depth -= 1
+        if outermost:
+            try:
+                if completed:
+                    _assert_conversion_caches_empty()
+            finally:
+                _clear_conversion_caches()
 
 
 # TODO optimize code details

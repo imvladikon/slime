@@ -11,6 +11,34 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 from slime.utils.types import ParamInfo
 
 
+_TE_EXPERT = re.compile(r"mlp\.experts\.(linear_fc[12])\.(weight|bias)(\d+)$")
+_LOCAL_EXPERT = re.compile(
+    r"mlp\.experts\.local_experts\.(\d+)\.(linear_fc[12])\.(weight|bias)$"
+)
+
+
+def _canonical_expert_name(
+    rest: str, expert_offset: int, num_local_experts: int | None
+) -> str | None:
+    """Return the rank-independent expert name used by conversion and rollout sync."""
+    local_match = _LOCAL_EXPERT.fullmatch(rest)
+    if local_match:
+        local_index, projection, param_type = local_match.groups()
+        local_index = int(local_index)
+        if num_local_experts is not None and not 0 <= local_index < num_local_experts:
+            raise ValueError(f"Local expert index {local_index} is outside [0, {num_local_experts})")
+        return f"mlp.experts.{projection}.{param_type}{local_index + expert_offset}"
+
+    te_match = _TE_EXPERT.fullmatch(rest)
+    if te_match:
+        projection, param_type, local_index = te_match.groups()
+        local_index = int(local_index)
+        if num_local_experts is not None and not 0 <= local_index < num_local_experts:
+            raise ValueError(f"Local expert index {local_index} is outside [0, {num_local_experts})")
+        return f"mlp.experts.{projection}.{param_type}{local_index + expert_offset}"
+    return None
+
+
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     """
     All-gather TP-sharded param to full tensor. expert_bias→param,
@@ -139,7 +167,14 @@ def named_params_and_buffers(args: Namespace, model: Sequence[torch.nn.Module]) 
     """
     ep_size = mpu.get_expert_model_parallel_world_size()
     ep_rank = mpu.get_expert_model_parallel_rank()
+    expert_offset = 0
+    num_local_experts = None
     if args.num_experts:
+        if args.num_experts % ep_size:
+            raise ValueError(
+                f"num_experts={args.num_experts} must be divisible by expert parallel size {ep_size}"
+            )
+        num_local_experts = args.num_experts // ep_size
         expert_offset = ep_rank * args.num_experts // ep_size
 
     sig = inspect.signature(get_transformer_layer_offset)
@@ -168,27 +203,25 @@ def named_params_and_buffers(args: Namespace, model: Sequence[torch.nn.Module]) 
 
                 # MTP layer indices start from 0
                 layer_idx, rest = match.groups()
-                expert_pattern = r"transformer_layer\.mlp\.experts\.(.+)\.(weight|bias)(\d+)"
-                match = re.match(expert_pattern, rest)
-                if not match:
+                transformer_layer_prefix = "transformer_layer."
+                if not rest.startswith(transformer_layer_prefix):
                     yield name, param
                     continue
-
-                rest, param_type, expert_idx = match.groups()
-                expert_idx = int(expert_idx) + expert_offset
-                yield f"{prefix}mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.{param_type}{expert_idx}", param
+                expert_name = _canonical_expert_name(
+                    rest.removeprefix(transformer_layer_prefix), expert_offset, num_local_experts
+                )
+                if expert_name is None:
+                    yield name, param
+                    continue
+                yield f"{prefix}mtp.layers.{layer_idx}.{transformer_layer_prefix}{expert_name}", param
                 continue
 
             layer_idx, rest = match.groups()
             layer_idx = int(layer_idx) + layer_offset
 
-            # this is hardcoded for te grouped matmul
-            expert_pattern = r"mlp\.experts\.(.+)\.(weight|bias)(\d+)"
-            match = re.match(expert_pattern, rest)
-            if match:
-                rest, param_type, expert_idx = match.groups()
-                expert_idx = int(expert_idx) + expert_offset
-                yield f"{prefix}decoder.layers.{layer_idx}.mlp.experts.{rest}.{param_type}{expert_idx}", param
+            expert_name = _canonical_expert_name(rest, expert_offset, num_local_experts)
+            if expert_name is not None:
+                yield f"{prefix}decoder.layers.{layer_idx}.{expert_name}", param
             else:
                 yield f"{prefix}decoder.layers.{layer_idx}.{rest}", param
 

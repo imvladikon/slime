@@ -17,7 +17,7 @@ from slime.utils import accelerator
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.http_utils import _wrap_ipv6
 
-from ..megatron_to_hf import convert_to_hf
+from ..megatron_to_hf import conversion_cache_scope, convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
 
 
@@ -138,11 +138,12 @@ class UpdateWeightFromDistributed:
         yields broadcast-ready chunks (bucketing happens internally); subclasses
         override ``_on_chunk`` to inject per-chunk behaviour.
         """
-        for chunk_iter in (self._iter_non_expert_chunks(), self._iter_expert_chunks()):
-            for hf_chunk in chunk_iter:
-                self._on_chunk(hf_chunk)
-                self._update_bucket_weights_from_distributed(hf_chunk, pbar=pbar)
-            dist.barrier(group=get_gloo_group())
+        with conversion_cache_scope():
+            for chunk_iter in (self._iter_non_expert_chunks(), self._iter_expert_chunks()):
+                for hf_chunk in chunk_iter:
+                    self._on_chunk(hf_chunk)
+                    self._update_bucket_weights_from_distributed(hf_chunk, pbar=pbar)
+                dist.barrier(group=get_gloo_group())
 
     def _on_chunk(self, hf_chunk: list[tuple[str, torch.Tensor]]) -> None:
         """

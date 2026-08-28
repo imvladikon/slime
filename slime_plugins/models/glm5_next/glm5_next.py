@@ -21,6 +21,7 @@ def _apply_config(config, text_config) -> list[int]:
     config.mhc_num_residual_streams = int(text_config.hc_mult)
     config.mhc_sinkhorn_iterations = int(text_config.hc_sinkhorn_iters)
     config.mhc_rms_epsilon_inside_sqrt = True
+    config.mhc_mapping_proj_fp32 = False
     config.use_fused_mhc = False
     if getattr(config, "recompute_granularity", None) == "full":
         raise ValueError("GLM-5.3 mHC requires selective recompute; full-layer recompute is unsupported")
@@ -41,6 +42,9 @@ def _apply_config(config, text_config) -> list[int]:
         "num_layers": int(text_config.num_hidden_layers),
         "hidden_size": int(text_config.hidden_size),
         "num_attention_heads": int(text_config.num_attention_heads),
+        "layernorm_epsilon": float(text_config.rms_norm_eps),
+        "hidden_dropout": 0.0,
+        "attention_dropout": float(getattr(text_config, "attention_dropout", 0.0)),
         "ffn_hidden_size": int(text_config.intermediate_size),
         "num_moe_experts": int(text_config.n_routed_experts),
         "moe_ffn_hidden_size": int(text_config.moe_intermediate_size),
@@ -55,6 +59,7 @@ def _apply_config(config, text_config) -> list[int]:
         "moe_router_score_function": "sigmoid",
         "moe_router_dtype": "fp32",
         "moe_router_enable_expert_bias": True,
+        "moe_router_bias_update_rate": 1e-3,
         "moe_router_topk_scaling_factor": float(text_config.routed_scaling_factor),
         "moe_router_num_groups": int(text_config.n_group),
         "moe_router_group_topk": int(text_config.topk_group),

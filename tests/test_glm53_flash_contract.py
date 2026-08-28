@@ -127,6 +127,134 @@ def test_real_tiny_checkpoint_round_trips_representative_state_families():
     assert torch.equal(hf_scale, reader.get_tensor(hf_scale_name))
 
 
+def test_real_tiny_checkpoint_exhaustively_round_trips_all_text_tensors():
+    import slime.backends.megatron_utils.megatron_to_hf as conversion
+    from slime.backends.megatron_utils.megatron_to_hf.glm5_next import _HC_BUFFERS
+
+    checkpoint = _tiny_checkpoint()
+    config = load_glm5_next_config(checkpoint)
+    text = get_text_config(config)
+    reader = SafetensorReader(checkpoint)
+    args = SimpleNamespace(
+        vocab_size=text.vocab_size,
+        hidden_size=text.hidden_size,
+        num_attention_heads=text.num_attention_heads,
+        num_query_groups=text.num_key_value_heads,
+        kv_channels=64,
+        q_lora_rank=text.q_lora_rank,
+        num_experts=text.n_routed_experts,
+        params_dtype=torch.bfloat16,
+        force_fp8_ue8m0_scale=False,
+    )
+    names = [
+        "module.module.embedding.word_embeddings.weight",
+        "module.module.decoder.final_layernorm.weight",
+        "module.module.output_layer.weight",
+    ]
+    common = ["input_layernorm.weight", "pre_mlp_layernorm.weight"]
+    hc = [
+        f"{site}.{name}"
+        for site in ("self_attention_hyper_connection", "mlp_hyper_connection")
+        for name in ("mapping_proj.weight", "bias", "alpha_pre", "alpha_post", "alpha_res")
+    ]
+    kda = [
+        f"self_attention.kda.{name}"
+        for name in (
+            "q_proj.weight",
+            "k_proj.weight",
+            "v_proj.weight",
+            "conv1d.weight",
+            "b_proj.weight",
+            "f_a_proj.weight",
+            "f_b_proj.weight",
+            "g_a_proj.weight",
+            "g_b_proj.weight",
+            "A_log",
+            "dt_bias",
+            "o_norm.weight",
+            "o_proj.weight",
+        )
+    ]
+    dsa = [
+        f"self_attention.{name}"
+        for name in (
+            "linear_q_down_proj.weight",
+            "q_layernorm.weight",
+            "linear_q_up_proj.weight",
+            "linear_kv_down_proj.weight",
+            "kv_layernorm.weight",
+            "linear_kv_up_proj.weight",
+            "linear_proj.weight",
+            "wq_b.weight",
+            "wk.weight",
+            "weights_proj.weight",
+            "k_norm.weight",
+            "k_norm.bias",
+            "index_kpool_compress_gate",
+            "index_kpool_compress_ape",
+        )
+    ]
+    kda_layers, dsa_layers = map(set, attention_schedules(text))
+    for layer in range(text.num_hidden_layers):
+        layer_names = common + hc + (kda if layer in kda_layers else dsa)
+        if text.mlp_layer_types[layer] == "dense":
+            layer_names += ["mlp.linear_fc1.weight", "mlp.linear_fc2.weight"]
+        else:
+            layer_names += [
+                "mlp.router.weight",
+                "mlp.router.expert_bias",
+                "mlp.shared_experts.linear_fc1.weight",
+                "mlp.shared_experts.linear_fc2.weight",
+            ]
+            layer_names += [
+                f"mlp.experts.linear_fc{projection}.weight{expert}"
+                for expert in range(text.n_routed_experts)
+                for projection in (1, 2)
+            ]
+        names += [f"module.module.decoder.layers.{layer}.{name}" for name in layer_names]
+
+    conversion._cached_tensors.clear()
+    _HC_BUFFERS.clear()
+    exported = {}
+    for name in names:
+        parameter = glm5_next_hf_tensor(name, reader, config)
+        for hf_name, tensor in conversion.convert_to_hf(args, "glm5_next", name, parameter):
+            assert hf_name not in exported, f"Duplicate exported tensor {hf_name}"
+            exported[hf_name] = tensor
+
+    expected_names = {name for name in reader.weight_map if not name.startswith("model.visual.")}
+    assert len(names) == 175
+    assert len(expected_names) == len(exported) == 184
+    assert set(exported) == expected_names
+    for name in expected_names:
+        expected = reader.get_tensor(name)
+        actual = exported[name]
+        assert actual.shape == expected.shape, name
+        assert actual.dtype == expected.dtype, name
+        assert torch.equal(actual, expected), name
+    assert not conversion._cached_tensors
+    assert not _HC_BUFFERS
+
+
+def test_conversion_cache_scope_fails_closed_and_cleans_up():
+    import slime.backends.megatron_utils.megatron_to_hf as conversion
+    from slime.backends.megatron_utils.megatron_to_hf.glm5_next import _HC_BUFFERS
+
+    with pytest.raises(RuntimeError, match="incomplete paired tensors"):
+        with conversion.conversion_cache_scope():
+            conversion._cached_tensors["unpaired"] = torch.ones(1)
+            _HC_BUFFERS[(1, "3", "attn")] = {"alpha_pre": torch.ones(1)}
+    assert not conversion._cached_tensors
+    assert not _HC_BUFFERS
+
+    with pytest.raises(ValueError, match="interrupted"):
+        with conversion.conversion_cache_scope():
+            conversion._cached_tensors["unpaired"] = torch.ones(1)
+            raise ValueError("interrupted conversion")
+    assert not conversion._cached_tensors
+    assert not _HC_BUFFERS
+
+
 @pytest.mark.parametrize(
     "hf_name",
     [
@@ -198,6 +326,7 @@ def test_real_tiny_image_sft_rollout_preserves_media_and_mask_alignment(monkeypa
     from slime.rollout import sft_rollout
     from slime.utils.processing_utils import build_processor_kwargs, load_processor, process_vision_info
     from slime.utils.types import Sample
+    from slime_plugins.models.glm5_next.vision import build_glm5_next_visual
 
     checkpoint = _tiny_checkpoint()
     image = Image.new("RGB", (28, 28), "red")
@@ -246,6 +375,15 @@ def test_real_tiny_image_sft_rollout_preserves_media_and_mask_alignment(monkeypa
     assert sft_rollout.MASK_GENERATOR.get_text_from_loss_mask(output.tokens, full_mask) == [
         "</think>A red square."
     ]
+    visual = build_glm5_next_visual(str(checkpoint), device=torch.device("cpu"), dtype=torch.bfloat16)
+    with torch.no_grad():
+        image_embeddings = visual(
+            output.multimodal_train_inputs["pixel_values"].to(torch.bfloat16),
+            output.multimodal_train_inputs["image_grid_thw"],
+        )
+    assert image_embeddings.shape == (16, 256)
+    assert torch.isfinite(image_embeddings).all()
+    assert not any(parameter.requires_grad for parameter in visual.parameters())
 
     blue = Image.new("RGB", (28, 28), "blue")
     interleaved = [
