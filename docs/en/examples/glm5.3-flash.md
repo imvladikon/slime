@@ -16,13 +16,14 @@ The dependency lock is `docker/glm53-flash.lock`:
 - full model metadata: `zai-org/GLM-5.3-Flash@04c4e9e95c5da8862dced7e5056455116f83a7e0`
 - tiny source: `inference-optimization/GLM-5.3-Flash-0.1B-A0.1B@7c3a6d3dc51732dd8ab230888e06ba8c93a381ac`
 
-The official Z.ai/SGLang cookbook is the serving baseline for an existing HF
-checkpoint. It does not cover Megatron training, Megatron-to-HF export, live
-policy synchronization, or R3 routing replay. The pinned SGLang engine already
-implements GLM-5.3-Flash serving; this lane adds those training seams. In
-particular, the Docker build compiles `sglang-router` from the same pinned
-SGLang source because the older prebuilt gateway silently discarded native
-`/generate` extensions such as `return_routed_experts`.
+The SGLang cookbook linked by Z.ai is the official recommended serving baseline
+for an existing HF checkpoint. It does not cover Megatron training,
+Megatron-to-HF export, live policy synchronization, or R3 routing replay. The
+pinned SGLang engine already implements GLM-5.3-Flash serving; this lane adds
+those training seams. In particular, the Docker build compiles
+`sglang-router` from the same pinned SGLang source because the older prebuilt
+gateway silently discarded native `/generate` extensions such as
+`return_routed_experts`.
 
 Build the current Slime checkout with those exact dependency commits:
 
@@ -147,15 +148,17 @@ All framework and rollout seeds are fixed. SGLang's global
 runtime rejects it with the DSA attention backend; exact token reproducibility
 is therefore not claimed for DSA kernels.
 
-The executed SFT step produced loss `10.75537` and gradient norm `85.06071`.
-The two RL iterations then produced gradient norms `14.79418` and `12.84961`,
-entropies `2.89863` and `2.91417`, and policy/reference log-probability absolute
-differences `0.002934` and `0.003097`; each iteration generated two samples with
-raw mean reward `0.5`. The first policy update advanced the rollout version from
-1 to 2, reset and resynchronized it as version 3, and the second generation
-consumed version 3. The second update similarly advanced through versions 4 and
-5. Both post-step destructive comparisons passed, as did the independent
-`visual.*` checksum across the complete two-rollout lifecycle.
+The final clean run `final-13ffd738` was executed from Slime commit
+`13ffd738912c4653e12cbc5d2901c49eea5a568f`. Its SFT step produced loss
+`10.755826` and gradient norm `85.069893`. The two RL iterations then produced
+gradient norms `14.812646` and `12.890700`, entropies `2.901259` and `2.911986`,
+and policy/reference log-probability absolute differences `0.001825` and
+`0.004316`; each iteration generated two samples with raw mean reward `0.5`.
+The first policy update advanced the rollout version from 1 to 2, reset and
+resynchronized it as version 3, and the second generation consumed version 3.
+The second update similarly advanced through versions 4 and 5. Both post-step
+destructive comparisons passed, as did the independent `visual.*` checksum
+across the complete two-rollout lifecycle.
 
 The strict final export gate found all 223 expected tensors. Exactly 160
 language tensors changed, all 39 vision tensors and all seven frozen DSA indexer
@@ -306,10 +309,14 @@ therefore a memory requirement of this candidate, not a throughput-only
 choice.
 
 The BF16 KV cache, TileLang DSA pair, DeepGEMM runner, and disabled shared
-expert fusion follow the official H200 serving recipe. DeepEP here is the
-separate MoE all-to-all transport used by the rollout engine. The official
-H200 recipe is itself marked unverified, so these settings remain a
-target-cluster acceptance candidate rather than a production claim.
+expert fusion follow the Z.ai-linked SGLang H200 serving cell. DeepEP here is
+the separate MoE all-to-all transport used by the rollout engine. The cookbook
+is an official recommended serving reference, but its verification badge is
+hardware-and-command specific: the linked GB300 Low Latency FP8/TRT-LLM cell
+is `Verified`, while the H200 cell from which these settings are taken is
+currently `Not Verified`. Consequently, our modified colocated H200 command
+still requires target-cluster acceptance and is not presented as a production
+claim.
 
 `mem_fraction_static` is applied by SGLang to memory visible before rollout
 weights load, not to total H200 capacity. In the colocated plan that is the GPU
