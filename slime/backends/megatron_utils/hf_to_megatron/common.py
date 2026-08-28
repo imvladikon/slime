@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import functools
 import json
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
@@ -11,8 +11,12 @@ from safetensors import safe_open
 
 
 class SafetensorReader:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, max_open_files: int = 2):
+        if max_open_files < 1:
+            raise ValueError("max_open_files must be positive")
         self.path = Path(path)
+        self.max_open_files = max_open_files
+        self._cached_tensor: tuple[str, torch.Tensor] | None = None
         index_path = self.path / "model.safetensors.index.json"
         if index_path.is_file():
             with index_path.open() as index_file:
@@ -25,26 +29,52 @@ class SafetensorReader:
             for file in files:
                 with safe_open(file, framework="pt", device="cpu") as tensors:
                     self.weight_map.update(dict.fromkeys(tensors.keys(), file.name))
-        self._files = {}
+        self._files = OrderedDict()
+
+    def _get_file(self, filename: str):
+        handle = self._files.pop(filename, None)
+        if handle is None:
+            handle = safe_open(self.path / filename, framework="pt", device="cpu")
+            handle.__enter__()
+        self._files[filename] = handle
+        while len(self._files) > self.max_open_files:
+            _old_filename, old_handle = self._files.popitem(last=False)
+            old_handle.__exit__(None, None, None)
+        return handle
+
+    def close(self) -> None:
+        self._cached_tensor = None
+        while self._files:
+            _filename, handle = self._files.popitem(last=False)
+            handle.__exit__(None, None, None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __contains__(self, name: str) -> bool:
         return name in self.weight_map
 
-    @functools.lru_cache(maxsize=1)  # noqa: B019 - cache belongs to this reader instance
     def get_tensor(self, name: str) -> torch.Tensor:
+        if self._cached_tensor is not None and self._cached_tensor[0] == name:
+            return self._cached_tensor[1]
         try:
             filename = self.weight_map[name]
         except KeyError as exc:
             raise KeyError(f"HuggingFace checkpoint does not contain {name!r}") from exc
-        if filename not in self._files:
-            self._files[filename] = safe_open(self.path / filename, framework="pt", device="cpu")
-        tensor = self._files[filename].get_tensor(name)
+        tensor = self._get_file(filename).get_tensor(name)
         scale_name = f"{name}_scale_inv"
         if tensor.element_size() == 1 and scale_name in self:
             scale_file = self.weight_map[scale_name]
-            if scale_file not in self._files:
-                self._files[scale_file] = safe_open(self.path / scale_file, framework="pt", device="cpu")
-            scale = self._files[scale_file].get_tensor(scale_name).float()
+            scale = self._get_file(scale_file).get_tensor(scale_name).float()
             rows, columns = tensor.shape
             block_rows, block_columns = scale.shape
             tensor = F.pad(
@@ -54,6 +84,7 @@ class SafetensorReader:
             tensor = tensor.view(block_rows, 128, block_columns, 128)
             tensor.mul_(scale[:, None, :, None])
             tensor = tensor.reshape(block_rows * 128, block_columns * 128)[:rows, :columns].to(torch.bfloat16)
+        self._cached_tensor = (name, tensor)
         return tensor
 
 
@@ -159,8 +190,7 @@ def load_model_hf_weights(
 ) -> None:
     from slime.backends.megatron_utils.update_weight.common import named_params_and_buffers
 
-    reader = SafetensorReader(path)
-    with torch.no_grad():
+    with SafetensorReader(path) as reader, torch.no_grad():
         for name, parameter in named_params_and_buffers(args, model):
             tensor = get_hf_tensor(name, reader, config)
             if name.endswith("output_layer.weight") and parameter.shape[0] == 1 and tensor.shape[0] != 1:

@@ -322,6 +322,26 @@ def test_fp8_reader_dequantizes_in_fp32_before_casting_to_bf16(tmp_path: Path):
     assert not torch.equal(actual, premature_bf16)
 
 
+def test_safetensor_reader_bounds_open_full_checkpoint_shards(tmp_path: Path):
+    weight_map = {}
+    for index, name in enumerate(("a", "b", "c"), start=1):
+        filename = f"model-{index:05d}-of-00003.safetensors"
+        save_file({name: torch.full((2,), index, dtype=torch.float32)}, tmp_path / filename)
+        weight_map[name] = filename
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map}), encoding="utf-8"
+    )
+
+    with SafetensorReader(tmp_path, max_open_files=2) as reader:
+        first = reader.get_tensor("a")
+        reader.get_tensor("b")
+        reader.get_tensor("c")
+        assert len(reader._files) == 2
+        assert list(reader._files) == [weight_map["b"], weight_map["c"]]
+        torch.testing.assert_close(first, torch.ones(2))
+    assert not reader._files
+
+
 def test_real_tiny_image_sft_rollout_preserves_media_and_mask_alignment(monkeypatch):
     from slime.rollout import sft_rollout
     from slime.utils.processing_utils import build_processor_kwargs, load_processor, process_vision_info
