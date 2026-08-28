@@ -98,6 +98,10 @@ For a comprehensive quick start guide covering environment setup, data preparati
 
 We also provide examples for some use cases not covered in the quick start guide; please check [examples](examples/).
 
+The [GLM-5.3-Flash lifecycle guide](docs/en/examples/glm5.3-flash.md) covers the
+locked Megatron/SGLang dependency lane, an executed tiny SFT + GRPO cycle, and
+the metadata-only full-model memory and synchronization preflight.
+
 ### Agentic RL examples
 
 For agentic RL workloads, the following examples plug into the standard rollout / Data Buffer loop through customization interfaces — they are not separate frameworks:

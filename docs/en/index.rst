@@ -68,6 +68,7 @@ Start by Use Case
    examples/glm4.7-30B-A3B.md
    examples/qwen3-30B-A3B.md
    examples/glm5.2-744B-A40B.md
+   examples/glm5.3-flash.md
    examples/glm4.7-355B-A32B.md
    examples/deepseek-r1.md
 
