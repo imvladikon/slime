@@ -106,6 +106,10 @@ class Glm5NextDSAAttention(DSAMLASelfAttention):
         self.index_kpool_compress_gate.requires_grad_(False)
         self.index_kpool_compress_ape.requires_grad_(False)
 
+    def _normalize_index_k(self, index_k: torch.Tensor) -> torch.Tensor:
+        """Apply the released BF16 LayerNorm contract to projected index keys."""
+        return self.k_norm(index_k.squeeze(1)).to(index_k.dtype)
+
     def get_absorb_query_key_value_tensors(self, hidden_states, packed_seq_params):
         if hidden_states.ndim != 3:
             raise ValueError(f"Expected [sequence, batch, hidden], got {tuple(hidden_states.shape)}")
@@ -157,7 +161,7 @@ class Glm5NextDSAAttention(DSAMLASelfAttention):
 
         detached_hidden = hidden_states.detach()
         index_k, _ = self.wk(detached_hidden)
-        index_k = self.k_norm(index_k.squeeze(1).float()).to(index_k.dtype)
+        index_k = self._normalize_index_k(index_k)
         if self.config.sequence_parallel:
             index_k = gather_from_sequence_parallel_region(index_k)
 
