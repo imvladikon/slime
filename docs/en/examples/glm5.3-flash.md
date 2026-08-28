@@ -11,8 +11,8 @@ training implementation does.
 The dependency lock is `docker/glm53-flash.lock`:
 
 - CUDA 13 base image: `lmsysorg/sglang:glm-5.3-flash@sha256:e6f5482505e7502f791fe4615ad1fbec118cbbd6b44e98f2479b16b98b985ad6`
-- Megatron-LM: `imvladikon/Megatron-LM@55d7af820f8be92e6ce48cee0c0f9336e898e238`
-- SGLang: `imvladikon/sglang@3a62fee2d2f682f4e6b1dfb4bc7cffcd2bda5ec2`
+- Megatron-LM: `imvladikon/Megatron-LM@366ae1b219a212c36be03923a05a207d174cbe22`
+- SGLang: `imvladikon/sglang@b26f2c18c00259a15e2829db9bfef96ea2365972`
 - full model metadata: `zai-org/GLM-5.3-Flash@04c4e9e95c5da8862dced7e5056455116f83a7e0`
 - tiny source: `inference-optimization/GLM-5.3-Flash-0.1B-A0.1B@7c3a6d3dc51732dd8ab230888e06ba8c93a381ac`
 
