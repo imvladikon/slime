@@ -71,12 +71,23 @@ def _validate_tiny_config(config: dict) -> None:
         "qk_width": text.get("qk_head_dim") == 64
         and text.get("qk_nope_head_dim") == 64
         and text.get("qk_rope_head_dim") == 0,
-        "mtp": text.get("num_nextn_predict_layers") == 0,
+        "mtp": text.get("num_nextn_predict_layers") == 0
+        and text.get("index_share_for_mtp_iteration") is False,
         "mhc": text.get("mhc") is True and text.get("hc_mult") == 4,
     }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise ValueError(f"tiny config contract failed: {failed}")
+
+
+def _validate_config_unchanged(source: dict, candidate: dict) -> None:
+    if candidate != source:
+        differing = sorted(
+            key
+            for key in set(source).union(candidate)
+            if source.get(key) != candidate.get(key)
+        )
+        raise ValueError(f"candidate config differs from normalized source: {differing}")
 
 
 def verify(
@@ -132,9 +143,12 @@ def verify(
     if strict_contract and changed_indexer:
         raise ValueError(f"frozen DSA indexer tensors changed: {changed_indexer[:3]}")
 
+    with (source / "config.json").open(encoding="utf-8") as handle:
+        source_config = json.load(handle)
     with (candidate / "config.json").open(encoding="utf-8") as handle:
         config = json.load(handle)
     if strict_contract:
+        _validate_config_unchanged(source_config, config)
         _validate_tiny_config(config)
     else:
         if config.get("model_type") != "glm5_next":

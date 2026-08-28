@@ -22,7 +22,9 @@ from safetensors.torch import load_file, save_file
 SOURCE_REPOSITORY = "inference-optimization/GLM-5.3-Flash-0.1B-A0.1B"
 SOURCE_REVISION = "7c3a6d3dc51732dd8ab230888e06ba8c93a381ac"
 SOURCE_MODEL_SHA256 = "0f0645f3da199f6c2f381c4f50f2729d6e455dbd3e87f91974202807ee1e5df8"
+SOURCE_CONFIG_SHA256 = "6f22cc97eceb0ddff73aff4bc3c23d38361843f186f5cded2d8981d8ed8c13b2"
 NORMALIZED_MODEL_SHA256 = "c8859ffe8b82f4e7346f49abaef98b52378f95a32df2c32e18b5156890857d84"
+NORMALIZED_CONFIG_SHA256 = "ffe59c74dc9f3bcb9eec45129e1d0d57891c183769462035924aa42968d7e34f"
 EXPECTED_TENSORS = 223
 EXPECTED_DTYPE_CHANGES = 32
 HC_FP32_SUFFIXES = (
@@ -56,6 +58,7 @@ def normalize(source: Path, output: Path) -> dict:
     source = source.resolve()
     output = output.resolve()
     source_checkpoint = source / "model.safetensors"
+    source_config = source / "config.json"
     if not source_checkpoint.is_file():
         raise FileNotFoundError(source_checkpoint)
     if output.exists():
@@ -68,7 +71,12 @@ def normalize(source: Path, output: Path) -> dict:
         raise ValueError(
             f"tiny source hash {source_hash} does not match {SOURCE_MODEL_SHA256}"
         )
-    config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+    source_config_hash = sha256(source_config)
+    if source_config_hash != SOURCE_CONFIG_SHA256:
+        raise ValueError(
+            f"tiny source config hash {source_config_hash} does not match {SOURCE_CONFIG_SHA256}"
+        )
+    config = json.loads(source_config.read_text(encoding="utf-8"))
     text = config["text_config"]
     layer_types = text["layer_types"]
     if config.get("model_type") != "glm5_next":
@@ -93,6 +101,7 @@ def normalize(source: Path, output: Path) -> dict:
         raise ValueError(f"unexpected tiny runtime QK width {runtime_qk_head_dim}")
     text["qk_head_dim"] = runtime_qk_head_dim
     text["num_nextn_predict_layers"] = 0
+    text["index_share_for_mtp_iteration"] = False
     text["linear_attn_config"].update(
         {"kda_layers": kda_layers, "full_attn_layers": dsa_layers}
     )
@@ -124,11 +133,14 @@ def normalize(source: Path, output: Path) -> dict:
         "source_repository": SOURCE_REPOSITORY,
         "source_revision": SOURCE_REVISION,
         "source_model_sha256": source_hash,
+        "source_config_sha256": source_config_hash,
         "normalized_model_sha256": NORMALIZED_MODEL_SHA256,
+        "normalized_config_sha256": NORMALIZED_CONFIG_SHA256,
         "full_model_tensor_payloads_read": False,
         "config_changes": {
             "text_config.qk_head_dim": runtime_qk_head_dim,
             "text_config.num_nextn_predict_layers": 0,
+            "text_config.index_share_for_mtp_iteration": False,
             "text_config.linear_attn_config.kda_layers": kda_layers,
             "text_config.linear_attn_config.full_attn_layers": dsa_layers,
         },
@@ -144,6 +156,11 @@ def normalize(source: Path, output: Path) -> dict:
             if item.is_file() and item.name != source_checkpoint.name:
                 shutil.copy2(item, temporary / item.name)
         write_json(temporary / "config.json", config)
+        normalized_config_hash = sha256(temporary / "config.json")
+        if normalized_config_hash != NORMALIZED_CONFIG_SHA256:
+            raise ValueError(
+                f"normalized config hash {normalized_config_hash} does not match {NORMALIZED_CONFIG_SHA256}"
+            )
         save_file(converted, temporary / source_checkpoint.name, metadata=metadata)
         normalized_hash = sha256(temporary / source_checkpoint.name)
         if normalized_hash != NORMALIZED_MODEL_SHA256:

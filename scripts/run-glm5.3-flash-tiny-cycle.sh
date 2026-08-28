@@ -15,15 +15,27 @@ fi
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
 # shellcheck disable=SC1091
-source "${GLM53_LOCK_FILE:-${REPO_ROOT}/docker/glm53-flash.lock}"
+LOCK_FILE=${GLM53_LOCK_FILE:-${REPO_ROOT}/docker/glm53-flash.lock}
+source "${LOCK_FILE}"
 PYTHON_BIN=${PYTHON_BIN:-python}
 TINY_CHECKPOINT=${GLM53_TINY_CHECKPOINT:-}
 MEGATRON_ROOT=${MEGATRON_ROOT:-/root/Megatron-LM}
 SGLANG_ROOT=${SGLANG_ROOT:-/root/sglang-source}
 RUN_ID=${GLM53_RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}
 OUTPUT_ROOT=${GLM53_OUTPUT_ROOT:-/tmp/slime-glm53-flash-${RUN_ID}}
-SFT_HF=${GLM53_SFT_HF_CHECKPOINT:-${OUTPUT_ROOT}/sft-hf_0}
+SFT_HF_ORACLE=${OUTPUT_ROOT}/sft-hf_0
+SFT_HF_OFFLINE=${OUTPUT_ROOT}/sft-hf-offline
+if [[ "${MODE}" = "rl" ]]; then
+  SFT_HF=${GLM53_SFT_HF_CHECKPOINT:-${SFT_HF_OFFLINE}}
+else
+  # An all-mode qualification must feed its freshly produced SFT export into
+  # RL; accepting an external override would silently break lifecycle coverage.
+  SFT_HF=${SFT_HF_OFFLINE}
+fi
+RL_HF_ORACLE=${OUTPUT_ROOT}/rl-hf_1
+RL_HF_OFFLINE=${OUTPUT_ROOT}/rl-hf-offline
 ALLOW_UNPINNED=${GLM53_ALLOW_UNPINNED:-0}
+ALLOW_EXISTING_OUTPUT=${GLM53_ALLOW_EXISTING_OUTPUT:-0}
 
 if [[ "${MODE}" != "rl" && ( -z "${TINY_CHECKPOINT}" || ! -f "${TINY_CHECKPOINT}/model.safetensors" ) ]]; then
   echo "Set GLM53_TINY_CHECKPOINT to the normalized tiny checkpoint directory." >&2
@@ -44,11 +56,13 @@ check_revision() {
   local expected=$3
   local actual
   actual=$(git -C "${root}" rev-parse HEAD 2>/dev/null || true)
-  if [[ "${actual}" != "${expected}" ]]; then
+  local dirty
+  dirty=$(git -C "${root}" status --porcelain 2>/dev/null || true)
+  if [[ "${actual}" != "${expected}" || -n "${dirty}" ]]; then
     if [[ "${ALLOW_UNPINNED}" = "1" ]]; then
-      echo "WARNING: ${name} HEAD ${actual:-missing} does not match ${expected}." >&2
+      echo "WARNING: ${name} is not a clean checkout of ${expected} (HEAD ${actual:-missing})." >&2
     else
-      echo "${name} HEAD ${actual:-missing} does not match locked commit ${expected}." >&2
+      echo "${name} must be a clean checkout of ${expected} (HEAD ${actual:-missing})." >&2
       exit 2
     fi
   fi
@@ -59,7 +73,8 @@ if [[ "${MODE}" != "sft" ]]; then
   check_revision SGLang "${SGLANG_ROOT}" "${SGLANG_COMMIT}"
 fi
 if [[ "${MODE}" != "rl" ]]; then
-  "${PYTHON_BIN}" - "${TINY_CHECKPOINT}" "${TINY_NORMALIZED_MODEL_SHA256}" "${TINY_MODEL_REVISION}" <<'PY'
+  "${PYTHON_BIN}" - "${TINY_CHECKPOINT}" "${TINY_NORMALIZED_MODEL_SHA256}" \
+    "${TINY_NORMALIZED_CONFIG_SHA256}" "${TINY_MODEL_REVISION}" <<'PY'
 import hashlib
 import json
 import sys
@@ -67,7 +82,8 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 expected_hash = sys.argv[2]
-expected_revision = sys.argv[3]
+expected_config_hash = sys.argv[3]
+expected_revision = sys.argv[4]
 digest = hashlib.sha256()
 with (root / "model.safetensors").open("rb") as handle:
     for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
@@ -75,16 +91,32 @@ with (root / "model.safetensors").open("rb") as handle:
 actual_hash = digest.hexdigest()
 if actual_hash != expected_hash:
     raise SystemExit(f"normalized tiny hash {actual_hash} does not match {expected_hash}")
+actual_config_hash = hashlib.sha256((root / "config.json").read_bytes()).hexdigest()
+if actual_config_hash != expected_config_hash:
+    raise SystemExit(
+        f"normalized tiny config hash {actual_config_hash} does not match {expected_config_hash}"
+    )
 with (root / "contract_normalization.json").open(encoding="utf-8") as handle:
     provenance = json.load(handle)
 if provenance.get("source_revision") != expected_revision:
     raise SystemExit("normalized tiny source revision does not match the lock")
 if provenance.get("normalized_model_sha256") != expected_hash:
     raise SystemExit("normalized tiny provenance hash does not match the lock")
+if provenance.get("normalized_config_sha256") != expected_config_hash:
+    raise SystemExit("normalized tiny config provenance hash does not match the lock")
 PY
 fi
 
+if [[ -d "${OUTPUT_ROOT}" && -n "$(find "${OUTPUT_ROOT}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  if [[ "${ALLOW_EXISTING_OUTPUT}" != "1" ]]; then
+    echo "Refusing nonempty GLM53_OUTPUT_ROOT: ${OUTPUT_ROOT}" >&2
+    echo "Use a new run directory, or set GLM53_ALLOW_EXISTING_OUTPUT=1 explicitly." >&2
+    exit 2
+  fi
+  echo "WARNING: reusing nonempty output directory ${OUTPUT_ROOT}." >&2
+fi
 mkdir -p "${OUTPUT_ROOT}"
+MANIFEST_PATH=${OUTPUT_ROOT}/run-manifest.json
 export PYTHONPATH="${REPO_ROOT}:${MEGATRON_ROOT}:${SGLANG_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 export SGLANG_DSA_FUSE_TOPK=0
 export SGLANG_CACHE_DIR=${SGLANG_CACHE_DIR:-/tmp/sglang-glm53-cache}
@@ -139,6 +171,152 @@ print(json.dumps({"env_vars": {key: os.environ.get(key, "") for key in keys}}))
 PY
 )
 
+set_manifest_status() {
+  local status=$1
+  local exit_code=$2
+  "${PYTHON_BIN}" - "${MANIFEST_PATH}" "${status}" "${exit_code}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(0)
+document = json.loads(path.read_text(encoding="utf-8"))
+document["status"] = sys.argv[2]
+document["exit_code"] = int(sys.argv[3])
+temporary = path.with_suffix(path.suffix + ".tmp")
+temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+}
+
+record_checkpoint() {
+  local stage=$1
+  local checkpoint=$2
+  "${PYTHON_BIN}" - "${MANIFEST_PATH}" "${stage}" "${checkpoint}" <<'PY'
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+stage = sys.argv[2]
+root = Path(sys.argv[3]).resolve()
+config = root / "config.json"
+index = root / "model.safetensors.index.json"
+single = root / "model.safetensors"
+if not config.is_file():
+    raise SystemExit(f"checkpoint config is missing: {config}")
+if index.is_file():
+    document = json.loads(index.read_text(encoding="utf-8"))
+    weight_map = document.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise SystemExit(f"invalid checkpoint index: {index}")
+    files = [config, index] + [root / name for name in sorted(set(weight_map.values()))]
+elif single.is_file():
+    files = [config, single]
+else:
+    raise SystemExit(f"checkpoint weights are missing: {root}")
+
+digest = hashlib.sha256()
+file_records = []
+for path in files:
+    if not path.is_file():
+        raise SystemExit(f"checkpoint file is missing: {path}")
+    relative = path.relative_to(root).as_posix()
+    size = path.stat().st_size
+    digest.update(relative.encode("utf-8") + b"\0" + str(size).encode("ascii") + b"\0")
+    file_digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            file_digest.update(chunk)
+            digest.update(chunk)
+    file_records.append({"path": relative, "bytes": size, "sha256": file_digest.hexdigest()})
+
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest.setdefault("checkpoints", {})[stage] = {
+    "path": str(root),
+    "sha256": digest.hexdigest(),
+    "files": file_records,
+}
+temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, manifest_path)
+PY
+}
+
+compare_hf_exact() {
+  local left=$1
+  local right=$2
+  "${PYTHON_BIN}" - "${left}" "${right}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import torch
+from safetensors import safe_open
+
+
+def weight_map(root: Path) -> dict[str, str]:
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        document = json.loads(index.read_text(encoding="utf-8"))
+        return {str(key): str(value) for key, value in document["weight_map"].items()}
+    single = root / "model.safetensors"
+    with safe_open(single, framework="pt", device="cpu") as handle:
+        return {key: single.name for key in handle.keys()}
+
+
+left, right = map(Path, sys.argv[1:])
+maps = [weight_map(left), weight_map(right)]
+if set(maps[0]) != set(maps[1]):
+    missing = sorted(set(maps[0]) - set(maps[1]))
+    extra = sorted(set(maps[1]) - set(maps[0]))
+    raise SystemExit(f"checkpoint keys differ: missing={missing[:8]}, extra={extra[:8]}")
+
+handles = [{}, {}]
+try:
+    for key in sorted(maps[0]):
+        tensors = []
+        for side, root in enumerate((left, right)):
+            filename = maps[side][key]
+            handle = handles[side].get(filename)
+            if handle is None:
+                handle = safe_open(root / filename, framework="pt", device="cpu")
+                handles[side][filename] = handle
+            tensors.append(handle.get_tensor(key))
+        if tensors[0].shape != tensors[1].shape or tensors[0].dtype != tensors[1].dtype:
+            raise SystemExit(
+                f"{key} metadata differs: "
+                f"{tensors[0].shape}/{tensors[0].dtype} != {tensors[1].shape}/{tensors[1].dtype}"
+            )
+        if not torch.equal(tensors[0], tensors[1]):
+            raise SystemExit(f"{key} values differ")
+finally:
+    handles.clear()
+
+print(f"Exact HF parity: {len(maps[0])} tensors")
+PY
+}
+
+convert_torch_dist_offline() {
+  local input=$1
+  local origin=$2
+  local output=$3
+  "${PYTHON_BIN}" "${REPO_ROOT}/tools/convert_torch_dist_to_hf_ray.py" \
+    --input-dir "${input}" \
+    --origin-hf-dir "${origin}" \
+    --output-dir "${output}" \
+    --model-name glm5next \
+    --concurrency 1 \
+    --task-group-bytes 67108864 \
+    --max-file-bytes 16777216 \
+    --no-progress
+}
+
 unset RAY_ADDRESS
 if ray status >/dev/null 2>&1; then
   echo "Refusing to reuse an existing Ray cluster; stop it before qualification." >&2
@@ -147,6 +325,12 @@ fi
 ray start --head --dashboard-host=127.0.0.1 --dashboard-port=8265 --disable-usage-stats
 RAY_STARTED=1
 cleanup() {
+  local exit_code=$?
+  if [[ "${exit_code}" != "0" ]]; then
+    set +e
+    set_manifest_status failed "${exit_code}"
+    set -e
+  fi
   if [[ "${RAY_STARTED}" = "1" ]]; then
     ray stop --force >/dev/null
   fi
@@ -207,11 +391,21 @@ submit_job() {
     -- "${PYTHON_BIN}" train.py "$@"
 }
 
-"${PYTHON_BIN}" - "${OUTPUT_ROOT}/run-manifest.json" "${MODE}" "${RUN_ID}" \
+"${PYTHON_BIN}" - "${MANIFEST_PATH}" "${MODE}" "${RUN_ID}" \
   "${REPO_ROOT}" "${MEGATRON_ROOT}" "${SGLANG_ROOT}" "${TINY_CHECKPOINT}" \
-  "${SFT_HF}" "${ALLOW_UNPINNED}" <<'PY'
+  "${SFT_HF}" "${ALLOW_UNPINNED}" "${ALLOW_EXISTING_OUTPUT}" "${LOCK_FILE}" \
+  "${SGLANG_IMAGE}" "${MEGATRON_REPOSITORY}" "${MEGATRON_COMMIT}" \
+  "${SGLANG_REPOSITORY}" "${SGLANG_COMMIT}" "${FULL_MODEL_REPOSITORY}" \
+  "${FULL_MODEL_REVISION}" "${FULL_CONFIG_SHA256}" "${FULL_INDEX_SHA256}" \
+  "${FULL_HEADERS_SHA256}" "${TINY_MODEL_REPOSITORY}" "${TINY_MODEL_REVISION}" \
+  "${TINY_NORMALIZED_MODEL_SHA256}" "${TINY_NORMALIZED_CONFIG_SHA256}" \
+  "${TRANSFORMER_ENGINE_CUDA_ARCHS}" \
+  "${DEEPEP_CUDA_ARCH_LIST}" "${DEEPEP_PACKAGE_VERSION}" \
+  "${DEEPGEMM_PACKAGE_VERSION}" <<'PY'
+import hashlib
 import importlib.metadata
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -227,7 +421,37 @@ def git_state(root):
     return {"path": str(path), "head": head, "dirty": dirty}
 
 
-output, mode, run_id, slime, megatron, sglang, tiny, sft_hf, allow_unpinned = sys.argv[1:]
+(
+    output,
+    mode,
+    run_id,
+    slime,
+    megatron,
+    sglang,
+    tiny,
+    sft_hf,
+    allow_unpinned,
+    allow_existing_output,
+    lock_file,
+    sglang_image,
+    megatron_repository,
+    megatron_commit,
+    sglang_repository,
+    sglang_commit,
+    full_model_repository,
+    full_model_revision,
+    full_config_sha256,
+    full_index_sha256,
+    full_headers_sha256,
+    tiny_model_repository,
+    tiny_model_revision,
+    tiny_normalized_sha256,
+    tiny_normalized_config_sha256,
+    transformer_engine_cuda_archs,
+    deepep_cuda_arch_list,
+    deepep_package_version,
+    deepgemm_package_version,
+) = sys.argv[1:]
 packages = {}
 for name in ("ray", "safetensors", "torch", "transformers"):
     packages[name] = importlib.metadata.version(name)
@@ -236,6 +460,9 @@ manifest = {
     "mode": mode,
     "run_id": run_id,
     "lock_enforced": allow_unpinned != "1",
+    "existing_output_allowed": allow_existing_output == "1",
+    "status": "running",
+    "exit_code": None,
     "repositories": {
         "slime": git_state(slime),
         "megatron": git_state(megatron),
@@ -245,9 +472,40 @@ manifest = {
     "sft_hf_checkpoint": sft_hf,
     "packages": packages,
     "seeds": {"megatron": 1234, "rollout": 1234, "sglang": 1234},
+    "lock": {
+        "path": str(Path(lock_file).resolve()),
+        "sha256": hashlib.sha256(Path(lock_file).read_bytes()).hexdigest(),
+        "values": {
+            "SGLANG_IMAGE": sglang_image,
+            "MEGATRON_REPOSITORY": megatron_repository,
+            "MEGATRON_COMMIT": megatron_commit,
+            "SGLANG_REPOSITORY": sglang_repository,
+            "SGLANG_COMMIT": sglang_commit,
+            "FULL_MODEL_REPOSITORY": full_model_repository,
+            "FULL_MODEL_REVISION": full_model_revision,
+            "FULL_CONFIG_SHA256": full_config_sha256,
+            "FULL_INDEX_SHA256": full_index_sha256,
+            "FULL_HEADERS_SHA256": full_headers_sha256,
+            "TINY_MODEL_REPOSITORY": tiny_model_repository,
+            "TINY_MODEL_REVISION": tiny_model_revision,
+            "TINY_NORMALIZED_MODEL_SHA256": tiny_normalized_sha256,
+            "TINY_NORMALIZED_CONFIG_SHA256": tiny_normalized_config_sha256,
+            "TRANSFORMER_ENGINE_CUDA_ARCHS": transformer_engine_cuda_archs,
+            "DEEPEP_CUDA_ARCH_LIST": deepep_cuda_arch_list,
+            "DEEPEP_PACKAGE_VERSION": deepep_package_version,
+            "DEEPGEMM_PACKAGE_VERSION": deepgemm_package_version,
+        },
+    },
 }
-Path(output).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+path = Path(output)
+temporary = path.with_suffix(path.suffix + ".tmp")
+temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, path)
 PY
+
+if [[ "${MODE}" = "rl" ]]; then
+  record_checkpoint rl_input_sft "${SFT_HF}"
+fi
 
 if [[ "${MODE}" = "sft" || "${MODE}" = "all" ]]; then
   submit_job "glm53-sft-${RUN_ID}" \
@@ -271,14 +529,28 @@ if [[ "${MODE}" = "sft" || "${MODE}" = "all" ]]; then
     --lr 1e-5
   "${PYTHON_BIN}" "${REPO_ROOT}/tools/verify_glm53_flash_tiny_export.py" \
     --source "${TINY_CHECKPOINT}" \
-    --candidate "${SFT_HF}" \
-    --json-output "${OUTPUT_ROOT}/sft-export-verification.json"
+    --candidate "${SFT_HF_ORACLE}" \
+    --json-output "${OUTPUT_ROOT}/sft-live-export-verification.json"
+  convert_torch_dist_offline \
+    "${OUTPUT_ROOT}/sft-megatron/iter_0000000" \
+    "${TINY_CHECKPOINT}" \
+    "${SFT_HF_OFFLINE}"
+  compare_hf_exact "${SFT_HF_ORACLE}" "${SFT_HF_OFFLINE}"
+  "${PYTHON_BIN}" "${REPO_ROOT}/tools/verify_glm53_flash_tiny_export.py" \
+    --source "${TINY_CHECKPOINT}" \
+    --candidate "${SFT_HF_OFFLINE}" \
+    --json-output "${OUTPUT_ROOT}/sft-offline-export-verification.json"
+  record_checkpoint sft_live_oracle "${SFT_HF_ORACLE}"
+  record_checkpoint sft_output "${SFT_HF_OFFLINE}"
 fi
 
 if [[ "${MODE}" = "rl" || "${MODE}" = "all" ]]; then
   if [[ ! -f "${SFT_HF}/config.json" ]]; then
     echo "RL requires an SFT HF checkpoint at ${SFT_HF}." >&2
     exit 2
+  fi
+  if [[ "${MODE}" = "all" ]]; then
+    record_checkpoint rl_input_sft "${SFT_HF}"
   fi
   submit_job "glm53-rl-${RUN_ID}" \
     "${COMMON_ARGS[@]}" \
@@ -305,6 +577,7 @@ if [[ "${MODE}" = "rl" || "${MODE}" = "all" ]]; then
     --n-samples-per-prompt 2 \
     --global-batch-size 2 \
     --advantage-estimator grpo \
+    --use-rollout-routing-replay \
     --loss-type policy_loss \
     --eps-clip 0.2 \
     --eps-clip-high 0.2 \
@@ -334,8 +607,21 @@ if [[ "${MODE}" = "rl" || "${MODE}" = "all" ]]; then
     --lr 1e-6
   "${PYTHON_BIN}" "${REPO_ROOT}/tools/verify_glm53_flash_tiny_export.py" \
     --source "${SFT_HF}" \
-    --candidate "${OUTPUT_ROOT}/rl-hf_1" \
-    --json-output "${OUTPUT_ROOT}/rl-export-verification.json"
+    --candidate "${RL_HF_ORACLE}" \
+    --json-output "${OUTPUT_ROOT}/rl-live-export-verification.json"
+  convert_torch_dist_offline \
+    "${OUTPUT_ROOT}/rl-megatron/iter_0000001" \
+    "${SFT_HF}" \
+    "${RL_HF_OFFLINE}"
+  compare_hf_exact "${RL_HF_ORACLE}" "${RL_HF_OFFLINE}"
+  "${PYTHON_BIN}" "${REPO_ROOT}/tools/verify_glm53_flash_tiny_export.py" \
+    --source "${SFT_HF}" \
+    --candidate "${RL_HF_OFFLINE}" \
+    --json-output "${OUTPUT_ROOT}/rl-offline-export-verification.json"
+  record_checkpoint rl_live_oracle "${RL_HF_ORACLE}"
+  record_checkpoint rl_output "${RL_HF_OFFLINE}"
 fi
+
+set_manifest_status succeeded 0
 
 echo "GLM-5.3-Flash tiny lifecycle artifacts: ${OUTPUT_ROOT}"

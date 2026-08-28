@@ -80,3 +80,11 @@ def test_tiny_export_verifier_rejects_incomplete_contract_by_default(tmp_path):
 
     with pytest.raises(ValueError, match="tensor partition"):
         verifier.verify(source, candidate, reload_transformers=False)
+
+
+def test_tiny_export_verifier_rejects_semantic_config_change():
+    source = {"model_type": "glm5_next", "text_config": {"routed_scaling_factor": 2.5}}
+    candidate = {"model_type": "glm5_next", "text_config": {"routed_scaling_factor": 1.0}}
+
+    with pytest.raises(ValueError, match="config differs"):
+        verifier._validate_config_unchanged(source, candidate)

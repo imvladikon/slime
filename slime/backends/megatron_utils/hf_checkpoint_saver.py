@@ -36,6 +36,7 @@ def save_hf_model_to_path(
     save_path = path.resolve()
     if hf_checkpoint == save_path:
         raise ValueError("HF save output path must not point to the same directory as --hf-checkpoint")
+    _reject_unscalable_live_glm53_export(args)
     if not hf_checkpoint.is_dir():
         raise ValueError(
             f"--hf-checkpoint must be a local directory when saving raw HuggingFace weights: {args.hf_checkpoint}"
@@ -137,6 +138,20 @@ def save_hf_model_to_path(
 
     if is_save_rank:
         logger.info("Successfully saved HuggingFace model to %s", path)
+
+
+def _reject_unscalable_live_glm53_export(args) -> None:
+    full_contract = (
+        int(getattr(args, "num_layers", 0) or 0) == 45
+        and int(getattr(args, "hidden_size", 0) or 0) == 4096
+        and int(getattr(args, "num_experts", 0) or 0) == 288
+    )
+    if full_contract:
+        raise RuntimeError(
+            "Live HuggingFace export is disabled for full GLM-5.3-Flash because it reconstructs every "
+            "TP/EP tensor on every writer. Save the authoritative torch_dist checkpoint during training, "
+            "then run tools/convert_torch_dist_to_hf_ray.py as a separate bounded-memory conversion job."
+        )
 
 
 class _SafetensorShardWriter:

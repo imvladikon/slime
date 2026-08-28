@@ -55,7 +55,7 @@ _HC_SITE_SCALE = {
     "self_attention_hyper_connection": "hc_attn_scale",
     "mlp_hyper_connection": "hc_ffn_scale",
 }
-_LAYER = re.compile(r"(?:module\.)*decoder\.layers\.(\d+)\.(.+)")
+_LAYER = re.compile(r"(?:module\.)*(?:language_model\.)?decoder\.layers\.(\d+)\.(.+)")
 _HC_ALPHA = re.compile(r"(self_attention_hyper_connection|mlp_hyper_connection)\.(alpha_pre|alpha_post|alpha_res)")
 _LOCAL_EXPERT = re.compile(r"mlp\.experts\.local_experts\.(\d+)\.linear_fc([12])\.weight")
 _HC_BUFFERS: dict[tuple[int, str, str], dict[str, torch.Tensor]] = {}
@@ -83,6 +83,7 @@ def convert_glm5_next_to_hf(args, name, param):
     stripped = name
     while stripped.startswith("module."):
         stripped = stripped.removeprefix("module.")
+    stripped = stripped.removeprefix("language_model.")
 
     if stripped == "embedding.word_embeddings.weight":
         return [(f"{_TEXT_PREFIX}embed_tokens.weight", param)]
@@ -135,7 +136,11 @@ def convert_glm5_next_to_hf(args, name, param):
                 ]
             return [(expert_prefix + "down_proj.weight", param)]
 
-    return [(_nested(hf_name), tensor) for hf_name, tensor in convert_deepseekv3_to_hf(args, name, param)]
+    fallback_name = re.sub(r"^((?:module\.)*)language_model\.", r"\1", name)
+    return [
+        (_nested(hf_name), tensor)
+        for hf_name, tensor in convert_deepseekv3_to_hf(args, fallback_name, param)
+    ]
 
 
 __all__ = ["convert_glm5_next_to_hf"]

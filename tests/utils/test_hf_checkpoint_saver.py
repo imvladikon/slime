@@ -79,6 +79,20 @@ def test_save_hf_model_to_path_rejects_origin_checkpoint(tmp_path: Path):
         save_hf_model_to_path(args, tmp_path, model=None)
 
 
+def test_save_hf_model_to_path_rejects_full_glm53_live_export(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    args = SimpleNamespace(
+        hf_checkpoint=str(source),
+        num_layers=45,
+        hidden_size=4096,
+        num_experts=288,
+    )
+
+    with pytest.raises(RuntimeError, match="torch_dist checkpoint"):
+        save_hf_model_to_path(args, tmp_path / "output", model=None)
+
+
 def test_safetensor_shard_writer_writes_hf_index(tmp_path: Path):
     writer = _SafetensorShardWriter(tmp_path, enabled=True)
     writer.write([("layers.0.weight", torch.ones(2, 2)), ("layers.0.weight_scale", torch.ones(1))], shard_idx=0)

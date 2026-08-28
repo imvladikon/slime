@@ -18,12 +18,18 @@ sys.modules[SPEC.name] = verifier
 SPEC.loader.exec_module(verifier)
 
 
-def test_full_export_verifier_uses_headers_and_drops_mtp_scales(tmp_path, monkeypatch):
+def test_full_export_verifier_uses_headers_and_preserves_fp8_contract(tmp_path, monkeypatch):
     monkeypatch.setattr(verifier, "EXPECTED_SOURCE_TENSORS", 3)
-    monkeypatch.setattr(verifier, "EXPECTED_EXPORT_TENSORS", 1)
+    monkeypatch.setattr(verifier, "EXPECTED_EXPORT_TENSORS", 2)
+    monkeypatch.setattr(verifier, "EXPECTED_EXPORT_SCALE_TENSORS", 1)
 
     source_config = {
         "model_type": "glm5_next",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+        },
         "text_config": {
             "num_nextn_predict_layers": 1,
             "index_share_for_mtp_iteration": True,
@@ -31,6 +37,11 @@ def test_full_export_verifier_uses_headers_and_drops_mtp_scales(tmp_path, monkey
     }
     candidate_config = {
         "model_type": "glm5_next",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+        },
         "text_config": {
             "num_nextn_predict_layers": 0,
             "index_share_for_mtp_iteration": False,
@@ -69,7 +80,10 @@ def test_full_export_verifier_uses_headers_and_drops_mtp_scales(tmp_path, monkey
     candidate.mkdir()
     (candidate / "config.json").write_text(json.dumps(candidate_config), encoding="utf-8")
     save_file(
-        {"model.language_model.layers.0.weight": torch.ones(2, dtype=torch.bfloat16)},
+        {
+            "model.language_model.layers.0.weight": torch.ones(2).to(torch.float8_e4m3fn),
+            "model.language_model.layers.0.weight_scale_inv": torch.ones(1, dtype=torch.float32),
+        },
         candidate / "model.safetensors",
     )
 
@@ -79,8 +93,11 @@ def test_full_export_verifier_uses_headers_and_drops_mtp_scales(tmp_path, monkey
         source_headers_path,
         candidate,
         reload_transformers_config=False,
+        strict_source_hashes=False,
     )
 
     assert report["header_only_contract"] == "PASS"
-    assert report["export_tensors"] == 1
+    assert report["export_tensors"] == 2
+    assert report["scale_metadata_tensors"] == 1
+    assert report["candidate_value_tensors_checked"] == 2
     assert report["full_model_reload"] == "NOT_RUN_BY_DESIGN"
