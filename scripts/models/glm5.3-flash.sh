@@ -53,6 +53,7 @@ GLM53_NUM_MOE_LAYERS=$((GLM53_NUM_LAYERS - GLM53_NUM_DENSE_LAYERS))
 
 MODEL_ARGS=(
   --spec "slime_plugins.models.glm5_next.glm5_next" "get_glm5_next_spec"
+  --custom-model-provider-path "slime_plugins.models.glm5_next.vision.glm5_next_vlm_model_provider"
 
   --num-layers "${GLM53_NUM_LAYERS}"
   --hidden-size "${GLM53_HIDDEN_SIZE}"

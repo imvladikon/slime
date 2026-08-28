@@ -6,6 +6,18 @@ from slime.utils.arguments import parse_args
 from slime.utils.misc import should_run_periodic_action
 
 
+def _update_rollout_weights(args, actor_model, rollout_manager, *, refresh_snapshot: bool) -> None:
+    """Push actor weights and, in debug mode, prove the current state round-trips."""
+    actor_model.update_weights()
+    if not args.check_weight_update_equal:
+        return
+    if refresh_snapshot:
+        ray.get(rollout_manager.check_weights.remote(action="snapshot"))
+        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
+        actor_model.update_weights()
+    ray.get(rollout_manager.check_weights.remote(action="compare"))
+
+
 def train(args):
     configure_logger()
     release_train = args.release_train
@@ -24,10 +36,7 @@ def train(args):
         ray.get(rollout_manager.onload_weights.remote())
 
     # Always push actor weights to rollout once weights are loaded.
-    actor_model.update_weights()
-
-    if args.check_weight_update_equal:
-        ray.get(rollout_manager.check_weights.remote(action="compare"))
+    _update_rollout_weights(args, actor_model, rollout_manager, refresh_snapshot=False)
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
@@ -82,7 +91,7 @@ def train(args):
         offload_train(actor_trains)
         if args.offload_rollout and not release_train:
             ray.get(rollout_manager.onload_weights.remote())
-        actor_model.update_weights()
+        _update_rollout_weights(args, actor_model, rollout_manager, refresh_snapshot=True)
 
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())
