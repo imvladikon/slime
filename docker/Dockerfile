@@ -1,10 +1,13 @@
-ARG SGLANG_IMAGE_TAG=v0.5.15.post1-cu129
-FROM slimerl/sglang:${SGLANG_IMAGE_TAG} AS sglang
+ARG SGLANG_IMAGE=lmsysorg/sglang:glm-5.3-flash@sha256:e6f5482505e7502f791fe4615ad1fbec118cbbd6b44e98f2479b16b98b985ad6
+FROM ${SGLANG_IMAGE} AS sglang
 
 # ======================================== Arguments =============================================
 
 ARG PATCH_VERSION=latest
+ARG MEGATRON_REPOSITORY=https://github.com/NVIDIA/Megatron-LM.git
 ARG MEGATRON_COMMIT=1dcf0dafa884ad52ffb243625717a3471643e087
+ARG SGLANG_REPOSITORY=
+ARG SGLANG_COMMIT=
 ARG DEEPGEMM_COMMIT=b38a77cd193cf38f670caae192310521d24343be
 ARG DEEPEP_COMMIT=6845ffd9d59126ec0030c13e0e155935a61e5b5a
 ARG DEEPEP_CUDA_ARCH_LIST=
@@ -18,6 +21,21 @@ ARG TMS_CUDA_MAJOR=
 # ======================================== Setup =============================================
 
 WORKDIR /root/
+
+# An exact SGLang source checkout can replace the Python package shipped by the
+# base image.  Native extensions and CUDA dependencies continue to come from
+# the matching SGLang image, while the editable checkout supplies model and
+# scheduler fixes that must move in lockstep with slime.
+RUN if [ -n "${SGLANG_REPOSITORY}" ] && [ -n "${SGLANG_COMMIT}" ]; then \
+      mkdir -p /root/sglang-source && \
+      git -C /root/sglang-source init && \
+      git -C /root/sglang-source remote add origin "${SGLANG_REPOSITORY}" && \
+      git -C /root/sglang-source fetch --depth 1 origin "${SGLANG_COMMIT}" && \
+      git -C /root/sglang-source checkout --detach FETCH_HEAD && \
+      test "$(git -C /root/sglang-source rev-parse HEAD)" = "${SGLANG_COMMIT}" && \
+      pip install -e /root/sglang-source/python --no-deps; \
+    fi
+ENV PYTHONPATH=/root/sglang-source/python
 
 # ======================================== Apt dependencies =============================================
 
@@ -65,8 +83,9 @@ RUN NVCC_APPEND_FLAGS="--threads 4" \
   --no-build-isolation \
   --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
 
-RUN git clone https://github.com/NVIDIA/Megatron-LM.git --recursive && \
+RUN git clone "${MEGATRON_REPOSITORY}" Megatron-LM --recursive && \
     cd Megatron-LM && git checkout ${MEGATRON_COMMIT} && \
+    test "$(git rev-parse HEAD)" = "${MEGATRON_COMMIT}" && \
     pip install -e .
 
 # zhuzilin fork builds, grouped together right after Megatron-LM:
@@ -115,19 +134,22 @@ RUN rm -rf /root/.cache/pip /root/flash-attention
 
 # ====================================== Patches ============================================
 
+ARG ENABLE_MEGATRON_PATCH=1
 COPY docker/patch/${PATCH_VERSION}/megatron*.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
-    git update-index --refresh && \
-    git apply megatron.patch --3way && \
-    if grep -R -n '^<<<<<<< ' .; then \
-      echo "Patch failed to apply cleanly. Please resolve conflicts." && \
-      exit 1; \
-    fi && \
-    if [ -f megatron-sglang-aligned.patch ]; then \
-      git apply megatron-sglang-aligned.patch --3way && \
+    if [ "${ENABLE_MEGATRON_PATCH}" = "1" ]; then \
+      git update-index --refresh && \
+      git apply megatron.patch --3way && \
       if grep -R -n '^<<<<<<< ' .; then \
-        echo "megatron-sglang-aligned.patch failed to apply cleanly. Please resolve conflicts." && \
+        echo "Patch failed to apply cleanly. Please resolve conflicts." && \
         exit 1; \
+      fi && \
+      if [ -f megatron-sglang-aligned.patch ]; then \
+        git apply megatron-sglang-aligned.patch --3way && \
+        if grep -R -n '^<<<<<<< ' .; then \
+          echo "megatron-sglang-aligned.patch failed to apply cleanly. Please resolve conflicts." && \
+          exit 1; \
+        fi; \
       fi; \
     fi && \
     rm -f megatron*.patch
@@ -152,11 +174,22 @@ fi
 
 # ====================================== Install main package ============================================
 
+ARG SLIME_REPOSITORY=https://github.com/THUDM/slime.git
 ARG SLIME_COMMIT=main
-RUN git clone https://github.com/THUDM/slime.git /root/slime && \
-    cd /root/slime && \
-    git checkout ${SLIME_COMMIT} && \
-    pip install -e . --no-deps
+COPY . /tmp/slime-source
+RUN if [ "${SLIME_COMMIT}" = "local" ]; then \
+      rm -rf /root/slime && \
+      mv /tmp/slime-source /root/slime; \
+    else \
+      rm -rf /tmp/slime-source && \
+      git clone "${SLIME_REPOSITORY}" /root/slime && \
+      cd /root/slime && \
+      git checkout "${SLIME_COMMIT}"; \
+    fi && \
+    pip install -e /root/slime --no-deps
 
 RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
     pip install . --no-build-isolation
+
+RUN python -c "import torch, sglang; assert torch.version.cuda and torch.version.cuda.split('.')[0] == '13'; assert torch.__version__.split('+')[0].startswith('2.13.')" && \
+    pip check
