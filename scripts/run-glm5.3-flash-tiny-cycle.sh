@@ -144,7 +144,7 @@ if ray status >/dev/null 2>&1; then
   echo "Refusing to reuse an existing Ray cluster; stop it before qualification." >&2
   exit 2
 fi
-ray start --head --dashboard-host=127.0.0.1 --dashboard-port=8265
+ray start --head --dashboard-host=127.0.0.1 --dashboard-port=8265 --disable-usage-stats
 RAY_STARTED=1
 cleanup() {
   if [[ "${RAY_STARTED}" = "1" ]]; then
@@ -329,7 +329,6 @@ if [[ "${MODE}" = "rl" || "${MODE}" = "all" ]]; then
     --sglang-cuda-graph-backend-decode disabled \
     --sglang-disable-overlap-schedule \
     --sglang-random-seed 1234 \
-    --sglang-enable-deterministic-inference \
     --no-offload-train \
     --no-offload-rollout \
     --lr 1e-6

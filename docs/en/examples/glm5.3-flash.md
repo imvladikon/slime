@@ -95,6 +95,11 @@ checker prefix excludes the frozen vision tower from the destructive sync test;
 all synchronized language state, including KDA, DSA, mHC, MoE, embeddings, and
 LM head, is still reset and compared.
 
+All framework and rollout seeds are fixed. SGLang's global
+`--enable-deterministic-inference` is intentionally not used because the pinned
+runtime rejects it with the DSA attention backend; exact token reproducibility
+is therefore not claimed for DSA kernels.
+
 The launcher qualification produced a nonzero gradient norm (`14.8053`), generated two
 samples with raw mean reward `0.5`, synchronized three weight buckets before and
 after the policy step, and exported 223/223 expected tensors. Exactly 160
