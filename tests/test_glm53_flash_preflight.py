@@ -81,14 +81,23 @@ def _args(**overrides):
         rollout_num_gpus=576,
         rollout_gpus_per_engine=8,
         rollout_replicas=1,
+        rollout_batch_size=8,
+        n_samples_per_prompt=8,
+        rollout_max_response_len=65536,
+        use_rollout_routing_replay=True,
         actor_runtime_reserve_gib=24.0,
         rollout_runtime_reserve_gib=16.0,
+        rollout_cache_reserve_gib=16.0,
+        sglang_mem_fraction_static=0.54,
+        sglang_moe_a2a_backend="deepep",
+        sglang_deepep_mode="auto",
         gpu_memory_gib=141.0,
         memory_safety_fraction=0.9,
         backup_tags=1,
         gpus_per_node=8,
-        host_memory_gib=0.0,
+        host_memory_gib=512.0,
         aggregate_sync_bandwidth_gib_s=0.0,
+        update_weight_buffer_bytes=512 * 1024**2,
         sglang_eplb=False,
         sglang_redundant_experts=False,
         sglang_elastic_ep=False,
@@ -103,14 +112,23 @@ def _config():
             "num_hidden_layers": 45,
             "num_attention_heads": 64,
             "n_routed_experts": 288,
+            "num_experts_per_tok": 8,
             "moe_intermediate_size": 2048,
+            "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 42,
         }
     }
 
 
 def _inventory():
     size = 1_268_776_960
-    return {"largest_training_tensor": {"name": "lm_head.weight", "bytes": size, "gib": preflight.gib(size)}}
+    return {
+        "largest_training_tensor": {
+            "name": "lm_head.weight",
+            "bytes": size,
+            "gib": preflight.gib(size),
+        },
+        "native_checkpoint_bytes": 328_326_771_576,
+    }
 
 
 def test_parameter_classifier_distinguishes_flash_state_families():
@@ -134,8 +152,32 @@ def test_h200_colocated_floor_matches_official_metadata_calculation():
     assert report["actor"]["optimizer_gpu_gib_per_rank"] == pytest.approx(6.1067084)
     assert report["actor"]["persistent_gpu_floor_gib_per_rank"] == pytest.approx(38.15132)
     assert report["topology"]["rollout"]["model_floor_gib_per_rank"] == pytest.approx(38.74433)
-    assert report["memory"]["projected_phase_peak_gib"] == pytest.approx(100.89565)
-    assert report["sync"]["aggregate_target_write_tib_per_update"] == pytest.approx(20.940776)
+    assert report["topology"]["rollout"]["pre_model_available_gib_per_rank"] == pytest.approx(102.84868)
+    assert report["topology"]["rollout"]["static_allocation_gib_per_rank"] == pytest.approx(55.53829)
+    assert report["topology"]["rollout"]["cache_headroom_gib_per_rank"] == pytest.approx(16.79396)
+    assert report["topology"]["rollout"]["runtime_slack_gib_per_rank"] == pytest.approx(47.31039)
+    assert report["topology"]["rollout"]["r3"]["bytes_per_generated_token"] == 1440
+    assert report["topology"]["rollout"]["r3"]["raw_upper_gib_per_rollout"] == pytest.approx(5.625)
+    assert report["memory"]["projected_phase_peak_gib"] == pytest.approx(117.68961)
+    assert report["sync"]["aggregate_target_write_tib_per_update"] == pytest.approx(21.203150)
+    assert report["sync"]["expert_bf16_p2p_upper_tib_per_update"] == pytest.approx(39.8671875)
+    assert report["sync"]["expert_bf16_p2p_if_one_local_target_tib_per_update"] == pytest.approx(39.3134766)
+    assert report["sync"]["balanced_expert_egress_upper_gib_per_rank"] == pytest.approx(70.875)
+    assert report["sync"]["balanced_expert_egress_upper_gib_per_node"] == pytest.approx(567.0)
+    assert report["sync"]["dense_ipc_transient_gib_per_sending_rank"] == pytest.approx(2.36328125)
+    assert report["sync"]["expert_staging_and_ipc_upper_gib_per_rank"] == pytest.approx(1.0)
+    assert report["sync"]["expert_target_gib_per_layer_per_rank"] == pytest.approx(1.6875)
+    assert report["sync"]["minimum_expert_transfer_batches_per_layer"] == 4
+    assert report["sync"]["minimum_expert_transfer_batches_per_update"] == 168
+    assert report["export"]["output_checkpoint_gib"] == pytest.approx(298.7994)
+    assert report["export"]["model_only_torch_dist_source_gib"] == pytest.approx(583.6172)
+    assert report["export"]["source_plus_output_disk_gib"] == pytest.approx(882.4166)
+    assert report["export"]["full_adam_resume_estimate_tib"] == pytest.approx(3.98867)
+    assert report["export"]["full_rank_zero_weight_gather"] is False
+    assert report["export"]["nccl_collectives"] is False
+    assert report["export"]["live_full_hf_export_supported"] is False
+    assert report["rollout_initial_load"]["ideal_physical_read_tib"] == pytest.approx(21.500025)
+    assert report["rollout_initial_load"]["unpartitioned_per_rank_read_upper_tib"] == pytest.approx(172.0002)
 
 
 def test_h100_and_unqualified_distributed_seams_fail_closed():
@@ -195,3 +237,23 @@ def test_rollout_offload_and_expert_routing_fail_closed():
     assert any("frozen vision" in message for message in errors)
     assert any("EP>1" in message for message in errors)
     assert any("EPLB" in message for message in errors)
+
+
+def test_rollout_static_pool_and_deepep_backend_fail_closed():
+    report = preflight.calculate(
+        _args(
+            sglang_mem_fraction_static=0.30,
+            sglang_moe_a2a_backend="none",
+            sglang_deepep_mode="normal",
+            use_rollout_routing_replay=False,
+        ),
+        _config(),
+        _official_categories(),
+        _inventory(),
+    )
+
+    errors = [gate["message"] for gate in report["gates"] if gate["severity"] == "error"]
+    assert any("DeepEP MoE A2A" in message for message in errors)
+    assert any("DeepEP auto or low_latency" in message for message in errors)
+    assert any("R3 route-replay" in message for message in errors)
+    assert any("rollout model floor" in message or "cache headroom" in message for message in errors)

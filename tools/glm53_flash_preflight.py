@@ -11,6 +11,7 @@ they cannot be proven from checkpoint metadata.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -29,6 +30,9 @@ EXPECTED_TENSORS = 76_108
 EXPECTED_SHARDS = 62
 EXPECTED_NON_SCALE_PARAMETERS = 321_323_031_390
 EXPECTED_NATIVE_BYTES = 328_326_771_576
+SOURCE_CONFIG_SHA256 = "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f"
+SOURCE_INDEX_SHA256 = "3c3f40366a53c3fd7974b4eab7881a365a98c2a4329150befebab99fe7c18b05"
+SOURCE_HEADERS_SHA256 = "b01c2e4b5ed1595b7ad2cbcc9b70800a1f0009651f8581fa342c36ed41cdd813"
 MAX_SINGLE_HEADER_BYTES = 64 * 1024 * 1024
 MAX_AGGREGATE_HEADER_BYTES = 256 * 1024 * 1024
 EXPECTED_TRAINING = {
@@ -92,6 +96,30 @@ def numel(entry: dict[str, Any]) -> int:
 def read_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_source_hashes(config: Path, index: Path, headers: Path) -> dict[str, str]:
+    actual = {
+        "config": sha256(config),
+        "index": sha256(index),
+        "headers": sha256(headers),
+    }
+    expected = {
+        "config": SOURCE_CONFIG_SHA256,
+        "index": SOURCE_INDEX_SHA256,
+        "headers": SOURCE_HEADERS_SHA256,
+    }
+    if actual != expected:
+        raise ValueError(f"official metadata hash mismatch: {actual}")
+    return actual
 
 
 def strict_range(url: str, start: int, end: int) -> bytes:
@@ -541,9 +569,20 @@ def calculate(
     }
 
     rollout_model_bytes = 0.0
+    rollout_static_bytes = 0.0
     rollout_replicas = 0
     rollout = None
     if args.mode == "rl":
+        if args.sglang_moe_a2a_backend != "deepep":
+            add_gate(gates, "error", "full-scale rollout requires the DeepEP MoE A2A backend")
+        if args.sglang_deepep_mode not in {"auto", "low_latency"}:
+            add_gate(gates, "error", "full-scale rollout requires DeepEP auto or low_latency mode")
+        if not args.use_rollout_routing_replay:
+            add_gate(
+                gates,
+                "error",
+                "the all-to-all GLM-5.3-Flash actor requires a qualified R3 route-replay path",
+            )
         if text["num_attention_heads"] % args.rollout_tp:
             add_gate(gates, "error", "attention heads must be divisible by rollout TP")
         if num_experts % args.rollout_ep:
@@ -579,6 +618,46 @@ def calculate(
             + routed.rollout_bytes / args.rollout_ep
             + vision.rollout_bytes
         )
+        gpu_capacity_bytes = args.gpu_memory_gib * 2**30
+        # SGLang applies mem_fraction_static to the memory visible before it
+        # loads model weights.  In the colocated lane the resident actor has
+        # already consumed its persistent parameter/gradient/optimizer floor.
+        rollout_pre_model_available_bytes = gpu_capacity_bytes
+        if args.colocate:
+            rollout_pre_model_available_bytes -= actor_persistent_bytes
+        if rollout_pre_model_available_bytes <= 0:
+            add_gate(
+                gates,
+                "error",
+                "the actor persistent floor leaves no memory for the colocated rollout",
+            )
+        rollout_static_bytes = max(rollout_pre_model_available_bytes, 0) * args.sglang_mem_fraction_static
+        if rollout_static_bytes < rollout_model_bytes:
+            add_gate(
+                gates,
+                "error",
+                "SGLang static memory allocation is smaller than the rollout model floor",
+            )
+        rollout_static_headroom_bytes = rollout_static_bytes - rollout_model_bytes
+        requested_cache_reserve_bytes = args.rollout_cache_reserve_gib * 2**30
+        if rollout_static_headroom_bytes < requested_cache_reserve_bytes:
+            add_gate(
+                gates,
+                "error",
+                "SGLang static memory allocation leaves less KV/KDA cache headroom than requested",
+            )
+        rollout_runtime_slack_bytes = (
+            rollout_pre_model_available_bytes - rollout_static_bytes
+        )
+        requested_rollout_runtime_reserve_bytes = (
+            args.rollout_runtime_reserve_gib * 2**30
+        )
+        if rollout_runtime_slack_bytes < requested_rollout_runtime_reserve_bytes:
+            add_gate(
+                gates,
+                "error",
+                "SGLang mem_fraction_static leaves less activation/workspace slack than requested",
+            )
         if args.rollout_num_gpus % args.rollout_gpus_per_engine:
             add_gate(
                 gates,
@@ -603,18 +682,55 @@ def calculate(
             "gpus_per_engine": args.rollout_gpus_per_engine,
             "replicas": rollout_replicas,
             "model_floor_gib_per_rank": gib(rollout_model_bytes),
+            "pre_model_available_gib_per_rank": gib(rollout_pre_model_available_bytes),
+            "mem_fraction_static": args.sglang_mem_fraction_static,
+            "static_allocation_gib_per_rank": gib(rollout_static_bytes),
+            "cache_headroom_gib_per_rank": gib(rollout_static_headroom_bytes),
+            "cache_reserve_required_gib_per_rank": args.rollout_cache_reserve_gib,
+            "runtime_slack_gib_per_rank": gib(rollout_runtime_slack_bytes),
+            "runtime_reserve_required_gib_per_rank": args.rollout_runtime_reserve_gib,
+            "moe_a2a_backend": args.sglang_moe_a2a_backend,
+            "deepep_mode": args.sglang_deepep_mode,
+            "r3": {
+                "enabled": args.use_rollout_routing_replay,
+                "bytes_per_generated_token": (
+                    text["num_hidden_layers"] * text["num_experts_per_tok"] * 4
+                    if args.use_rollout_routing_replay
+                    else 0
+                ),
+                "raw_upper_gib_per_rollout": (
+                    args.rollout_batch_size
+                    * args.n_samples_per_prompt
+                    * args.rollout_max_response_len
+                    * text["num_hidden_layers"]
+                    * text["num_experts_per_tok"]
+                    * 4
+                    / 2**30
+                    if args.use_rollout_routing_replay
+                    else 0
+                ),
+            },
             "mtp_loaded": False,
             "vision_assumption": "fully replicated upper bound",
         }
 
     actor_train_peak = actor_persistent_bytes + args.actor_runtime_reserve_gib * 2**30
-    rollout_peak = rollout_model_bytes + args.rollout_runtime_reserve_gib * 2**30
-    sync_transient_bytes = 2 * inventory["largest_training_tensor"]["bytes"]
+    rollout_peak = rollout_static_bytes + args.rollout_runtime_reserve_gib * 2**30
+    dense_sync_transient_bytes = 2 * inventory["largest_training_tensor"]["bytes"]
+    expert_sync_transient_bytes = (
+        2 * args.update_weight_buffer_bytes if args.mode == "rl" else 0
+    )
+    sync_transient_bytes = max(
+        dense_sync_transient_bytes,
+        expert_sync_transient_bytes,
+    )
     sync_peak = actor_persistent_bytes + sync_transient_bytes
     if args.mode == "rl" and args.colocate:
-        actor_train_peak += rollout_model_bytes
+        # SGLang reserves its static model/KV pool while the colocated actor is
+        # resident, including during the actor's activation peak.
+        actor_train_peak += rollout_static_bytes
         rollout_peak += actor_persistent_bytes
-        sync_peak += rollout_model_bytes
+        sync_peak += rollout_static_bytes
 
     projected_peak = max(actor_train_peak, rollout_peak, sync_peak)
     usable_gpu_bytes = args.gpu_memory_gib * args.memory_safety_fraction * 2**30
@@ -638,15 +754,17 @@ def calculate(
     host_pinned_per_node = (
         actor_backup_per_node + vision_loader_staging_per_node + rollout_backup_per_node
     )
-    if (
-        args.host_memory_gib > 0
-        and host_pinned_per_node
-        > args.host_memory_gib * args.memory_safety_fraction * 2**30
-    ):
+    if args.host_memory_gib <= 0:
         add_gate(
             gates,
             "error",
-            "actor backup and offloaded optimizer exceed the host-memory safety budget",
+            "an explicit positive host-memory budget is required for production preflight",
+        )
+    elif host_pinned_per_node > args.host_memory_gib * args.memory_safety_fraction * 2**30:
+        add_gate(
+            gates,
+            "error",
+            "actor backup, optimizer, vision staging, and rollout backup exceed the host-memory safety budget",
         )
 
     add_gate(
@@ -665,6 +783,11 @@ def calculate(
             "warning",
             "the colocated estimate conservatively keeps actor and rollout weights resident together",
         )
+        add_gate(
+            gates,
+            "warning",
+            "target runtime must verify balanced rank-local expert source bytes and per-node egress",
+        )
 
     source_language_bytes = (
         regular.training_bytes
@@ -678,14 +801,69 @@ def calculate(
         + routed.rollout_bytes
         + frozen.rollout_bytes
     )
-    aggregate_target_bytes = target_language_bytes * rollout_replicas
+    target_write_per_replica = 0
+    if args.mode == "rl":
+        target_write_per_replica = (
+            regular.rollout_bytes
+            + routed.rollout_bytes * args.rollout_moe_dp
+            + (replicated.rollout_bytes + frozen.rollout_bytes)
+            * args.rollout_gpus_per_engine
+        )
+    aggregate_target_bytes = target_write_per_replica * rollout_replicas
+    expert_target_copies = (
+        rollout_replicas * args.rollout_moe_dp if args.mode == "rl" else 0
+    )
+    num_moe_layers = sum(
+        layer_type == "sparse" for layer_type in text["mlp_layer_types"]
+    )
+    expert_target_bytes_per_layer = (
+        routed.training_bytes / num_moe_layers / args.rollout_ep
+        if args.mode == "rl" and num_moe_layers
+        else 0
+    )
+    minimum_expert_batches_per_layer = (
+        math.ceil(expert_target_bytes_per_layer / args.update_weight_buffer_bytes)
+        if expert_target_bytes_per_layer
+        else 0
+    )
+    expert_bf16_p2p_upper_bytes = routed.training_bytes * expert_target_copies
+    expert_bf16_p2p_one_local_bytes = routed.training_bytes * max(
+        expert_target_copies - (1 if args.colocate else 0), 0
+    )
+    balanced_expert_source_bytes_per_rank = (
+        routed.training_bytes / world_size if args.mode == "rl" else 0
+    )
     sync = {
         "bf16_actor_language_payload_gib": gib(source_language_bytes),
         "rollout_runtime_language_payload_gib_per_replica": gib(target_language_bytes),
+        "target_write_gib_per_replica": gib(target_write_per_replica),
         "largest_source_tensor": inventory["largest_training_tensor"],
-        "minimum_ipc_transient_gib_per_sending_rank": gib(sync_transient_bytes),
+        "dense_ipc_transient_gib_per_sending_rank": gib(dense_sync_transient_bytes),
+        "expert_staging_and_ipc_upper_gib_per_rank": gib(expert_sync_transient_bytes),
+        "maximum_sync_transient_gib_per_rank": gib(sync_transient_bytes),
+        "expert_update_buffer_gib_per_rank": gib(args.update_weight_buffer_bytes),
+        "expert_target_gib_per_layer_per_rank": gib(expert_target_bytes_per_layer),
+        "minimum_expert_transfer_batches_per_layer": minimum_expert_batches_per_layer,
+        "minimum_expert_transfer_batches_per_update": (
+            minimum_expert_batches_per_layer * num_moe_layers
+        ),
         "rollout_replicas": rollout_replicas,
         "aggregate_target_write_tib_per_update": aggregate_target_bytes / 2**40,
+        "expert_bf16_p2p_upper_tib_per_update": expert_bf16_p2p_upper_bytes / 2**40,
+        "expert_bf16_p2p_if_one_local_target_tib_per_update": (
+            expert_bf16_p2p_one_local_bytes / 2**40
+        ),
+        "balanced_unique_expert_source_gib_per_rank": gib(
+            balanced_expert_source_bytes_per_rank
+        ),
+        "balanced_expert_egress_upper_gib_per_rank": gib(
+            balanced_expert_source_bytes_per_rank * expert_target_copies
+        ),
+        "balanced_expert_egress_upper_gib_per_node": gib(
+            balanced_expert_source_bytes_per_rank
+            * expert_target_copies
+            * args.gpus_per_node
+        ),
     }
     if args.aggregate_sync_bandwidth_gib_s > 0:
         sync["bandwidth_lower_bound_seconds"] = gib(aggregate_target_bytes) / args.aggregate_sync_bandwidth_gib_s
@@ -703,6 +881,48 @@ def calculate(
         "actor_backup_gib_per_node": gib(actor_backup_per_node),
         "vision_loader_staging_gib_per_node": gib(vision_loader_staging_per_node),
         "rollout_weight_backup_gib_per_node": gib(rollout_backup_per_node),
+    }
+    export_output_bytes = sum(category.checkpoint_bytes for category in categories.values())
+    # Training checkpoints contain the dequantized language state; the frozen
+    # vision tower is copied from the pinned HF source by the offline exporter.
+    model_only_dcp_bytes = source_language_bytes
+    trainable_language_numel = (
+        regular.parameter_numel + replicated.parameter_numel + routed.parameter_numel
+    )
+    full_adam_resume_estimate_bytes = (
+        trainable_language_numel * 14 + frozen.training_bytes
+    )
+    official_checkpoint_bytes = inventory.get("native_checkpoint_bytes", export_output_bytes)
+    export = {
+        "output_checkpoint_gib": gib(export_output_bytes),
+        "model_only_torch_dist_source_gib": gib(model_only_dcp_bytes),
+        "source_plus_output_disk_gib": gib(model_only_dcp_bytes + export_output_bytes),
+        "full_adam_resume_estimate_tib": full_adam_resume_estimate_bytes / 2**40,
+        "minimum_gather_and_conversion_transient_gib_per_writer": gib(
+            dense_sync_transient_bytes
+        ),
+        "full_rank_zero_weight_gather": False,
+        "conversion_mode": "key_chunk_targeted_dcp",
+        "nccl_collectives": False,
+        "live_full_hf_export_supported": False,
+        "default_task_group_gib": 2.0,
+        "default_output_shard_gib": 5.0,
+    }
+    rollout_initial_load = {
+        "prefetch_partition_required": args.mode == "rl",
+        "ideal_physical_read_tib": (
+            official_checkpoint_bytes * rollout_replicas / 2**40
+            if args.mode == "rl"
+            else 0
+        ),
+        "unpartitioned_per_rank_read_upper_tib": (
+            official_checkpoint_bytes
+            * rollout_replicas
+            * args.rollout_gpus_per_engine
+            / 2**40
+            if args.mode == "rl"
+            else 0
+        ),
     }
     errors = [gate for gate in gates if gate["severity"] == "error"]
     return {
@@ -734,6 +954,8 @@ def calculate(
         "actor": actor,
         "memory": memory,
         "sync": sync,
+        "export": export,
+        "rollout_initial_load": rollout_initial_load,
         "gates": gates,
     }
 
@@ -759,6 +981,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--memory-safety-fraction", type=float, default=0.90)
     parser.add_argument("--actor-runtime-reserve-gib", type=float, default=24.0)
     parser.add_argument("--rollout-runtime-reserve-gib", type=float, default=16.0)
+    parser.add_argument("--rollout-cache-reserve-gib", type=float, default=16.0)
+    parser.add_argument("--sglang-mem-fraction-static", type=float, default=0.54)
     parser.add_argument("--backup-tags", type=int, default=1)
     parser.add_argument("--distributed-optimizer", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--optimizer-offload", action="store_true")
@@ -779,7 +1003,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rollout-num-gpus", type=int, default=576)
     parser.add_argument("--rollout-gpus-per-engine", type=int, default=8)
     parser.add_argument("--rollout-replicas", type=int, default=1)
+    parser.add_argument("--rollout-batch-size", type=int, default=8)
+    parser.add_argument("--n-samples-per-prompt", type=int, default=8)
+    parser.add_argument("--rollout-max-response-len", type=int, default=65536)
+    parser.add_argument(
+        "--use-rollout-routing-replay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--sglang-moe-a2a-backend", choices=("deepep", "none"), default="deepep")
+    parser.add_argument(
+        "--sglang-deepep-mode",
+        choices=("auto", "low_latency", "normal"),
+        default="auto",
+    )
     parser.add_argument("--aggregate-sync-bandwidth-gib-s", type=float, default=0.0)
+    parser.add_argument("--update-weight-buffer-bytes", type=int, default=512 * 1024**2)
     parser.add_argument("--sglang-eplb", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--sglang-redundant-experts", action=argparse.BooleanOptionalAction, default=False
@@ -803,6 +1042,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "rollout_num_gpus",
         "rollout_gpus_per_engine",
         "rollout_replicas",
+        "rollout_batch_size",
+        "n_samples_per_prompt",
+        "rollout_max_response_len",
+        "update_weight_buffer_bytes",
         "backup_tags",
         "bf16_optimizer_bytes",
         "fp32_optimizer_bytes",
@@ -812,10 +1055,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"positive values required for: {invalid}")
     if not 0 < args.memory_safety_fraction <= 1:
         parser.error("--memory-safety-fraction must be in (0, 1]")
+    if not 0 < args.sglang_mem_fraction_static <= 1:
+        parser.error("--sglang-mem-fraction-static must be in (0, 1]")
     nonnegative = (
         "host_memory_gib",
         "actor_runtime_reserve_gib",
         "rollout_runtime_reserve_gib",
+        "rollout_cache_reserve_gib",
         "aggregate_sync_bandwidth_gib_s",
     )
     invalid = [name for name in nonnegative if getattr(args, name) < 0]
@@ -846,6 +1092,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(
             f"header cache is missing: {args.headers}; use --fetch-missing-headers"
         )
+    if args.strict_official:
+        validate_source_hashes(args.config, args.index, args.headers)
     validate_config(config)
     categories, inventory = build_inventory(
         config,

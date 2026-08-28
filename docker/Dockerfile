@@ -9,11 +9,13 @@ ARG MEGATRON_COMMIT=1dcf0dafa884ad52ffb243625717a3471643e087
 ARG SGLANG_REPOSITORY=
 ARG SGLANG_COMMIT=
 ARG DEEPGEMM_COMMIT=b38a77cd193cf38f670caae192310521d24343be
+ARG DEEPGEMM_PACKAGE_VERSION=0.1.5.post3
 ARG DEEPEP_COMMIT=6845ffd9d59126ec0030c13e0e155935a61e5b5a
+ARG DEEPEP_PACKAGE_VERSION=0.1.2
 ARG DEEPEP_CUDA_ARCH_LIST=
 ARG FLASH_QLA_COMMIT=821fd9d37ede18fdc2a4e707fefe3770bfc32e58
 ARG TRANSFORMER_ENGINE_COMMIT=c9877beb87ad7e711e1869dd0b5062167ede447a
-ARG TRANSFORMER_ENGINE_CUDA_ARCHS=100a;103a
+ARG TRANSFORMER_ENGINE_CUDA_ARCHS=90;100a;103a
 ARG TMS_COMMIT=8d30c59ca12a68d9deccbc9c6599076a1218cbc5
 
 ARG TMS_CUDA_MAJOR=
@@ -40,7 +42,7 @@ ENV PYTHONPATH=/root/sglang-source/python
 # ======================================== Apt dependencies =============================================
 
 RUN apt update
-RUN apt install -y nvtop rsync dnsutils prometheus
+RUN apt install -y nvtop rsync dnsutils prometheus protobuf-compiler
 
 # ====================================== Python dependencies ============================================
 
@@ -95,27 +97,46 @@ RUN TMS_CUDA_MAJOR="${TMS_CUDA_MAJOR:-$(python -c 'import torch; print(torch.ver
     export TMS_CUDA_MAJOR && \
     pip install git+https://github.com/zhuzilin/torch_memory_saver.git@${TMS_COMMIT} --no-cache-dir --force-reinstall
 
-# DeepGEMM's batch-invariant kernel selection; build the SGLang-compatible wheel.
-RUN git clone https://github.com/zhuzilin/DeepGEMM.git --recursive && \
-    cd DeepGEMM && git checkout ${DEEPGEMM_COMMIT} && \
-    git submodule update --init --recursive && \
-    bash build_sgl_deep_gemm.sh && \
-    pip install --force-reinstall --no-deps dist/sgl_deep_gemm-*.whl && \
-    cd /root/ && rm -rf DeepGEMM
+# The GLM CUDA 13 purpose image already contains SGLang's exact DeepGEMM
+# distribution.  The older custom source publishes version 0.0.0, which cannot
+# satisfy the locked SGLang metadata, and its batch-invariant API is unused by
+# the DSA qualification lane.  Retain that custom build only for legacy CUDA 12.
+RUN if [ "$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" = "13" ]; then \
+      python -c "from importlib.metadata import version; import deep_gemm, sys; assert version('sgl-deep-gemm') == sys.argv[1]; assert hasattr(deep_gemm, 'tf32_hc_prenorm_gemm')" "${DEEPGEMM_PACKAGE_VERSION}"; \
+    else \
+      git clone https://github.com/zhuzilin/DeepGEMM.git --recursive && \
+      cd DeepGEMM && git checkout ${DEEPGEMM_COMMIT} && \
+      git submodule update --init --recursive && \
+      bash build_sgl_deep_gemm.sh && \
+      pip install --force-reinstall --no-deps dist/sgl_deep_gemm-*.whl && \
+      cd /root/ && rm -rf DeepGEMM; \
+    fi
 
-# DeepEP low-latency alignment fork.  CUDA 13 relocated the CCCL/libcu++ headers
-# (<cuda/std/*>) under include/cccl, which nvshmem_tensor.h includes, so add that
-# directory to the compile search path (nvcc + host compiler) when it exists.
-RUN git clone https://github.com/zhuzilin/DeepEP.git /root/DeepEP && \
-    cd /root/DeepEP && git checkout ${DEEPEP_COMMIT} && \
-    CUDA_ARCHS="${DEEPEP_CUDA_ARCH_LIST:-9.0}" && \
-    if [ -d /usr/local/cuda/include/cccl ]; then \
-      export CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}"; \
-      export NVCC_PREPEND_FLAGS="-I/usr/local/cuda/include/cccl ${NVCC_PREPEND_FLAGS:-}"; \
-    fi && \
-    TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS=64 python setup.py bdist_wheel && \
-    pip install --force-reinstall --no-deps dist/deep_ep-*.whl && \
-    cd /root/ && rm -rf DeepEP
+# Keep the CUDA 13 purpose image's exact sgl-deep-ep distribution. Installing
+# the older `deep-ep` fork over it leaves two metadata owners for the same
+# import tree, so `pip check` cannot detect a mixed installation. The public
+# 0.1.2 wheel contains native sm_90, sm_100, and sm_103 cubins; validate Hopper
+# statically because importing DeepEP during an image build requires a GPU.
+# Legacy CUDA 12 retains the custom low-latency build.
+RUN if [ "$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" = "13" ]; then \
+      DEEPEP_EXTENSION="$(python -c "from importlib.metadata import PackageNotFoundError, distribution, version; import sys; assert version('sgl-deep-ep') == sys.argv[1]; d = distribution('sgl-deep-ep'); files = [p for p in (d.files or ()) if str(p).startswith('deep_ep/') and str(p).endswith('.so')]; assert len(files) == 1, files; print(d.locate_file(files[0]))" "${DEEPEP_PACKAGE_VERSION}")" && \
+      python -c "from importlib.metadata import distributions; names = {str(d.metadata['Name']).lower().replace('_', '-') for d in distributions()}; assert 'deep-ep' not in names, 'deep-ep and sgl-deep-ep both own the deep_ep import tree'" && \
+      test -f "${DEEPEP_EXTENSION}" && \
+      for arch in sm_90 sm_100 sm_103; do \
+        /usr/local/cuda/bin/cuobjdump --list-elf "${DEEPEP_EXTENSION}" | grep -Eq "${arch}([.]cubin)?$"; \
+      done; \
+    else \
+      git clone https://github.com/zhuzilin/DeepEP.git /root/DeepEP && \
+      cd /root/DeepEP && git checkout ${DEEPEP_COMMIT} && \
+      CUDA_ARCHS="${DEEPEP_CUDA_ARCH_LIST:-9.0}" && \
+      if [ -d /usr/local/cuda/include/cccl ]; then \
+        export CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}"; \
+        export NVCC_PREPEND_FLAGS="-I/usr/local/cuda/include/cccl ${NVCC_PREPEND_FLAGS:-}"; \
+      fi && \
+      TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS=64 python setup.py bdist_wheel && \
+      pip install --force-reinstall --no-deps dist/deep_ep-*.whl && \
+      cd /root/ && rm -rf DeepEP; \
+    fi
 
 RUN pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation
 
@@ -127,8 +148,17 @@ RUN pip install --ignore-installed PyJWT && \
 # Pin both packages together so downgrading NumPy does not leave an incompatible SciPy.
 RUN pip install "numpy==1.26.4" "scipy==1.17.1"
 
-RUN pip install https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl --force-reinstall
-RUN python -c "import sglang_router; assert 'slime' in sglang_router.__version__"
+# Build the router binding from the same pinned SGLang source as the engine.
+# A prebuilt router with an older typed GenerateRequest silently drops newer
+# native fields such as return_routed_experts, which breaks R3 training.
+RUN pip install 'maturin[patchelf]>=1.0,<2.0' && \
+    command -v cargo && command -v rustc && command -v protoc && \
+    cd /root/sglang-source/sgl-model-gateway/bindings/python && \
+    maturin build --release --out /tmp/sglang-router-wheel && \
+    pip install --force-reinstall --no-deps /tmp/sglang-router-wheel/sglang_router-*.whl && \
+    python -c "from importlib.metadata import version; import sglang_router.sglang_router_rs; assert version('sglang-router') == '0.3.2'" && \
+    rm -rf /root/sglang-source/sgl-model-gateway/target /tmp/sglang-router-wheel && \
+    pip uninstall -y maturin patchelf
 
 RUN rm -rf /root/.cache/pip /root/flash-attention
 
@@ -191,5 +221,5 @@ RUN if [ "${SLIME_COMMIT}" = "local" ]; then \
 RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
     pip install . --no-build-isolation
 
-RUN python -c "import torch, sglang; assert torch.version.cuda and torch.version.cuda.split('.')[0] == '13'; assert torch.__version__.split('+')[0].startswith('2.13.')" && \
+RUN python -c "import torch, sglang, transformer_engine.pytorch; assert torch.version.cuda and torch.version.cuda.split('.')[0] == '13'; assert torch.__version__.split('+')[0].startswith('2.13.')" && \
     pip check

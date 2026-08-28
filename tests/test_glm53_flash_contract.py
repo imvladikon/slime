@@ -18,8 +18,96 @@ from slime_plugins.models.glm5_next.config import (
     load_glm5_next_config,
     validate_glm5_next_checkpoint,
 )
+from slime_plugins.models.glm5_next.glm5_next import _make_te_norms_mhc_compatible
+from slime_plugins.models.glm5_next.vision import _validate_glm5_next_runtime
 
 NUM_GPUS = 0
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_full_profile_tracks_official_h200_serving_baseline():
+    script = (REPO_ROOT / "scripts/models/glm5.3-flash.sh").read_text(encoding="utf-8")
+    required = {
+        "--moe-token-dispatcher-type alltoall",
+        "--require-rank-local-expert-update",
+        "--update-weight-buffer-size 536870912",
+        "--sglang-dsa-prefill-backend tilelang",
+        "--sglang-dsa-decode-backend tilelang",
+        "--sglang-kv-cache-dtype bfloat16",
+        "--sglang-moe-runner-backend deep_gemm",
+        "--sglang-disable-shared-experts-fusion",
+        "--sglang-moe-a2a-backend deepep",
+        "--sglang-mem-fraction-static 0.54",
+        "--transformer-impl transformer_engine",
+        "--recompute-granularity selective",
+        "--recompute-modules mhc moe_act",
+    }
+
+    assert all(flag in script for flag in required)
+
+
+def test_te_layer_norms_use_tensor_only_abi_around_mhc():
+    identity = object()
+
+    class Backend:
+        calls = 0
+
+        def layer_norm(self):
+            self.calls += 1
+            return f"tensor-only-norm-{self.calls}"
+
+    backend = Backend()
+    moe = SimpleNamespace(input_layernorm="norm-with-residual", pre_mlp_layernorm="norm-with-residual")
+    _make_te_norms_mhc_compatible(moe, backend, identity)
+    assert (moe.input_layernorm, moe.pre_mlp_layernorm) == (
+        "tensor-only-norm-1",
+        "tensor-only-norm-2",
+    )
+
+    dense = SimpleNamespace(input_layernorm="norm-with-residual", pre_mlp_layernorm=identity)
+    _make_te_norms_mhc_compatible(dense, backend, identity)
+    assert dense.input_layernorm == "tensor-only-norm-3"
+    assert dense.pre_mlp_layernorm is identity
+
+
+def test_glm53_image_builds_gateway_from_pinned_sglang_source():
+    dockerfile = (REPO_ROOT / "docker/Dockerfile").read_text(encoding="utf-8")
+
+    assert "protobuf-compiler" in dockerfile
+    assert "sgl-model-gateway/bindings/python" in dockerfile
+    assert "maturin build --release" in dockerfile
+    assert "zhuzilin/sgl-router" not in dockerfile
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"offload_train": True}, "training offload"),
+        ({"release_train": True}, "release-train"),
+        ({"offload_rollout": True}, "weights-cpu-backup"),
+    ],
+)
+def test_glm53_runtime_rejects_unsafe_offload(overrides, message):
+    values = {
+        "offload_train": False,
+        "offload_rollout": False,
+        "release_train": False,
+        "sglang_enable_weights_cpu_backup": False,
+    }
+    values.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _validate_glm5_next_runtime(SimpleNamespace(**values))
+
+
+def test_glm53_runtime_allows_no_offload_and_backed_up_rollout():
+    _validate_glm5_next_runtime(
+        SimpleNamespace(
+            offload_train=False,
+            offload_rollout=True,
+            release_train=False,
+            sglang_enable_weights_cpu_backup=True,
+        )
+    )
 
 
 def _tiny_checkpoint() -> Path:
@@ -101,6 +189,13 @@ def test_real_tiny_checkpoint_round_trips_representative_state_families():
         converted = dict(convert_glm5_next_to_hf(args, megatron_name, loaded))
         assert set(converted) == {hf_name}
         assert torch.equal(converted[hf_name], reader.get_tensor(hf_name).to(converted[hf_name].dtype))
+
+    prefixed_name = "module.module.language_model.decoder.layers.3.mlp.experts.linear_fc2.weight7"
+    prefixed = glm5_next_hf_tensor(prefixed_name, reader, config)
+    converted_prefixed = dict(convert_glm5_next_to_hf(args, prefixed_name, prefixed))
+    prefixed_hf_name = "model.language_model.layers.3.mlp.experts.7.down_proj.weight"
+    assert set(converted_prefixed) == {prefixed_hf_name}
+    assert torch.equal(converted_prefixed[prefixed_hf_name], reader.get_tensor(prefixed_hf_name))
 
     conv_name = "module.module.decoder.layers.4.self_attention.kda.conv1d.weight"
     conv = glm5_next_hf_tensor(conv_name, reader, config)
