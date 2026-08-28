@@ -107,8 +107,10 @@ class Glm5NextDSAAttention(DSAMLASelfAttention):
         self.index_kpool_compress_ape.requires_grad_(False)
 
     def _normalize_index_k(self, index_k: torch.Tensor) -> torch.Tensor:
-        """Apply the released BF16 LayerNorm contract to projected index keys."""
-        return self.k_norm(index_k.squeeze(1)).to(index_k.dtype)
+        """Normalize projected keys in the LayerNorm parameter dtype."""
+        projected_dtype = index_k.dtype
+        norm_dtype = self.k_norm.weight.dtype if self.k_norm.weight is not None else projected_dtype
+        return self.k_norm(index_k.squeeze(1).to(norm_dtype)).to(projected_dtype)
 
     def get_absorb_query_key_value_tensors(self, hidden_states, packed_seq_params):
         if hidden_states.ndim != 3:
