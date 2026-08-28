@@ -1,4 +1,5 @@
 import hashlib
+import re
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 
@@ -151,29 +152,60 @@ def pack_param_info_buckets(
     param_infos: Sequence[ParamInfo],
     update_weight_buffer_size: int,
 ) -> list[list[ParamInfo]]:
+    grouped: dict[str, list[ParamInfo]] = {}
+    group_order: list[str] = []
+    for info in param_infos:
+        key = _conversion_group_key(info.name)
+        if key not in grouped:
+            grouped[key] = []
+            group_order.append(key)
+        grouped[key].append(info)
+
     param_info_buckets = [[]]  # Start with one empty bucket
     buffer_size = 0  # Track current bucket size in bytes
 
-    for info in param_infos:
-        # Expert params use expert-TP size, others use regular-TP size
-        if ".experts." in info.name:
-            tp_size = mpu.get_expert_tensor_parallel_world_size()
-        else:
-            tp_size = mpu.get_tensor_model_parallel_world_size()
+    for key in group_order:
+        infos = grouped[key]
+        group_size = 0
+        for info in infos:
+            tp_size = (
+                mpu.get_expert_tensor_parallel_world_size()
+                if ".experts." in info.name
+                else mpu.get_tensor_model_parallel_world_size()
+            )
+            group_size += info.size * tp_size
 
-        # Full param size = shard size × TP replicas (all-gather will reconstruct full param)
-        param_size = info.size * tp_size
-
-        # If adding this param exceeds limit AND current bucket has params: start new bucket
-        if buffer_size + param_size > update_weight_buffer_size and len(param_info_buckets[-1]) > 0:
+        if buffer_size + group_size > update_weight_buffer_size and param_info_buckets[-1]:
             param_info_buckets.append([])
             buffer_size = 0
-
-        # Add param to current bucket and update size
-        param_info_buckets[-1].append(info)
-        buffer_size += param_size
+        param_info_buckets[-1].extend(infos)
+        buffer_size += group_size
 
     return param_info_buckets
+
+
+_LAYER_PARAMETER = re.compile(
+    r"((?:module\.)*(?:language_model\.)?decoder\.layers\.\d+)\.(.+)"
+)
+
+
+def _conversion_group_key(name: str) -> str:
+    match = _LAYER_PARAMETER.fullmatch(name)
+    if not match:
+        return name
+    layer, rest = match.groups()
+    if rest in {
+        "self_attention.linear_q_down_proj.weight",
+        "self_attention.linear_kv_down_proj.weight",
+    }:
+        return f"{layer}.self_attention.q_kv_down_pair"
+    alpha = re.fullmatch(
+        r"(self_attention_hyper_connection|mlp_hyper_connection)\.alpha_(?:pre|post|res)",
+        rest,
+    )
+    if alpha:
+        return f"{layer}.{alpha.group(1)}.alpha_group"
+    return name
 
 
 def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Module]) -> list[ParamInfo]:
@@ -216,7 +248,7 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
         for src_rank, infos in param_infos_list:
             if src_rank == rank:
                 continue
-            for name, info in infos.items():
+            for _name, info in infos.items():
                 _merge_param_info(param_infos, info, reject_distinct_owner=False)
 
     if ep_size > 1:

@@ -52,6 +52,26 @@ class _EP2LocalExpertModel(_LocalExpertModel):
         )
 
 
+class _TEGroupedExpertModel:
+    config = SimpleNamespace()
+
+    @staticmethod
+    def named_parameters():
+        for expert in range(4):
+            yield (
+                f"module.decoder.layers.3.mlp.experts.linear_fc1.weight{expert}",
+                torch.nn.Parameter(torch.ones(4, 8)),
+            )
+            yield (
+                f"module.decoder.layers.3.mlp.experts.linear_fc2.weight{expert}",
+                torch.nn.Parameter(torch.ones(8, 2)),
+            )
+
+    @staticmethod
+    def named_buffers():
+        return []
+
+
 def _run_ep2_metadata_contract(rank, init_method):
     from megatron.core import parallel_state
     from slime.utils.distributed_utils import set_gloo_group
@@ -149,6 +169,34 @@ def test_local_mlp_ep2_names_cover_every_global_expert_and_hf_tensor(monkeypatch
         for expert in range(8)
         for projection in ("gate", "up", "down")
     } == set(exported)
+
+
+def test_te_grouped_mlp_ep2_names_cover_every_global_expert(monkeypatch):
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.update_weight.common.get_transformer_layer_offset",
+        lambda _config: 0,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.update_weight.common.mpu.get_expert_model_parallel_world_size",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.update_weight.common.mpu.get_expert_model_parallel_rank",
+        lambda: 1,
+    )
+
+    named = list(
+        named_params_and_buffers(
+            SimpleNamespace(num_experts=8),
+            [_TEGroupedExpertModel()],
+        )
+    )
+
+    assert {name for name, _param in named} == {
+        f"module.module.decoder.layers.3.mlp.experts.linear_fc{projection}.weight{expert}"
+        for expert in range(4, 8)
+        for projection in (1, 2)
+    }
 
 
 def test_ep_metadata_exchange_sends_only_routed_experts(monkeypatch):

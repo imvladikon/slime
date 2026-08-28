@@ -14,6 +14,20 @@ from slime_plugins.models.glm5_next.config import (
 _MHC_EPS = 1e-6
 
 
+def _make_te_norms_mhc_compatible(submodules, backend, identity_op) -> None:
+    """Use TE tensor-only norms around mHC-owned residual connections.
+
+    HyperConnectionTransformerLayer owns the n-stream residual captured before
+    normalization. TE's ``has_residual=True`` norm returns a single-stream
+    residual alongside the normalized tensor, which cannot replace that value.
+    Keep TE norm kernels but request their tensor-only ABI. Dense TE MLPs fuse
+    their norm into FC1 and therefore retain IdentityOp.
+    """
+    submodules.input_layernorm = backend.layer_norm()
+    if submodules.pre_mlp_layernorm is not identity_op:
+        submodules.pre_mlp_layernorm = backend.layer_norm()
+
+
 def _apply_config(config, text_config) -> list[int]:
     if float(text_config.hc_eps) != _MHC_EPS:
         raise ValueError(f"Megatron mHC uses eps={_MHC_EPS}, checkpoint uses {text_config.hc_eps}")
@@ -157,6 +171,8 @@ def get_glm5_next_spec(args, config, vp_stage=None):
         current.module = HyperConnectionTransformerLayer
         current.submodules.self_attention_hyper_connection = HyperConnectionModule
         current.submodules.mlp_hyper_connection = HyperConnectionModule
+        if use_transformer_engine:
+            _make_te_norms_mhc_compatible(current.submodules, backend, IdentityOp)
         if local_layer + offset in dsa_layers:
             current.submodules.self_attention = dsa_spec
         else:

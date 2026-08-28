@@ -549,6 +549,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--require-rank-local-expert-update",
+                action="store_true",
+                default=False,
+                help=(
+                    "Fail instead of falling back to full expert synchronization when the "
+                    "colocated Megatron/SGLang expert-routing plan cannot be built."
+                ),
+            )
+            parser.add_argument(
                 "--update-weights-interval",
                 type=int,
                 default=1,

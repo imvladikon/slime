@@ -286,6 +286,34 @@ class MegatronTrainRayActor(TrainRayActor):
         for iterator in data_iterator:
             iterator.reset()
 
+        routing_layers = []
+        for vp_stage, model in enumerate(self.model):
+            config = model.module.config
+            num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
+            offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+            for layer_id in range(offset, offset + num_layers_to_build):
+                if isinstance(config.moe_layer_freq, int):
+                    is_sparse = layer_id % config.moe_layer_freq == 0
+                else:
+                    assert len(config.moe_layer_freq) == config.num_layers
+                    is_sparse = config.moe_layer_freq[layer_id] != 0
+                if is_sparse:
+                    routing_layers.append((vp_stage, layer_id))
+
+        registered_replays = len(RoutingReplay.all_routing_replays)
+        if registered_replays != len(routing_layers):
+            raise RuntimeError(
+                "R3 router registration mismatch: "
+                f"Megatron registered {registered_replays} replay slot(s), but the local "
+                f"pipeline owns {len(routing_layers)} MoE layer(s) {routing_layers}. "
+                "Use the pinned Megatron-LM revision with the Slime TopKRouter replay bridge."
+            )
+        logger.info(
+            "R3 replay topology validated: %d router slot(s) for local MoE layers %s",
+            registered_replays,
+            routing_layers,
+        )
+
         for _ in range(sum(num_microbatches)):
             batch = data_iterator[0].get_next(["rollout_routed_experts", "tokens"])
             rollout_routed_experts = prepare_routed_experts_for_routing_replay(
@@ -297,24 +325,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 allgather_cp=self.args.allgather_cp,
             )
 
-            routing_replay_offset = 0
-            for vp_stage, model in enumerate(self.model):
-                config = model.module.config
-                num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
-                offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
-                for layer_id in range(offset, offset + num_layers_to_build):
-                    # skip dense layer
-                    if isinstance(config.moe_layer_freq, int):
-                        if layer_id % config.moe_layer_freq != 0:
-                            continue
-                    elif isinstance(config.moe_layer_freq, list):
-                        assert len(config.moe_layer_freq) == config.num_layers
-                        if config.moe_layer_freq[layer_id] == 0:
-                            continue
-                    layer_routed_experts = rollout_routed_experts[:, layer_id]
-                    RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_experts)
-                    routing_replay_offset += 1
-            assert routing_replay_offset == len(RoutingReplay.all_routing_replays)
+            for routing_replay_offset, (_, layer_id) in enumerate(routing_layers):
+                layer_routed_experts = rollout_routed_experts[:, layer_id]
+                RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_experts)
 
         del rollout_data["rollout_routed_experts"]
 

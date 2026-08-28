@@ -27,6 +27,20 @@ from slime_plugins.models.glm5_next.config import load_glm5_next_config
 _VISUAL_PREFIX = "model.visual."
 
 
+def _validate_glm5_next_runtime(args) -> None:
+    if getattr(args, "offload_train", False):
+        raise ValueError("GLM-5.3-Flash does not support training offload in the qualified lifecycle")
+    if getattr(args, "release_train", False):
+        raise ValueError("GLM-5.3-Flash does not support --release-train in the qualified lifecycle")
+    if getattr(args, "offload_rollout", False) and not getattr(
+        args, "sglang_enable_weights_cpu_backup", False
+    ):
+        raise ValueError(
+            "GLM-5.3-Flash rollout offload requires --sglang-enable-weights-cpu-backup "
+            "to preserve the frozen visual tower"
+        )
+
+
 class Glm5NextVisionMLP(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
@@ -227,6 +241,7 @@ def glm5_next_vlm_model_provider(pre_process=True, post_process=True, vp_stage=N
     from slime_plugins.models.glm5_next.glm5_next import get_glm5_next_spec
 
     args = get_args()
+    _validate_glm5_next_runtime(args)
     config = core_transformer_config_from_args(args)
     kwargs = {}
     if vp_stage is not None:

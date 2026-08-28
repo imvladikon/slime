@@ -23,7 +23,29 @@ case "${GLM53_FLASH_PROFILE}" in
     GLM53_INDEX_HEADS=32
     GLM53_INDEX_HEAD_DIM=128
     GLM53_INDEX_TOPK=2048
-    GLM53_OPTIMIZED_MOE_ARGS=(--moe-grouped-gemm --moe-permute-fusion)
+    # EP=72 exceeds the qualified deterministic DeepEP training gate (EP=8).
+    # Use Megatron's standard all-to-all dispatcher for training and reserve
+    # DeepEP for the EP=8 SGLang rollout engines.
+    GLM53_OPTIMIZED_MOE_ARGS=(--moe-grouped-gemm --moe-permute-fusion --moe-token-dispatcher-type alltoall)
+    GLM53_SYNC_ARGS=(--require-rank-local-expert-update --update-weight-buffer-size 536870912)
+    # Full-layer recompute is incompatible with mHC.  Keep the mHC chain and
+    # grouped-MoE activation on Megatron's supported selective path.
+    GLM53_TRANSFORMER_ARGS=(
+      --transformer-impl transformer_engine
+      --recompute-granularity selective
+      --recompute-modules mhc moe_act
+    )
+    GLM53_SGLANG_ARGS=(
+      --sglang-weight-loader-prefetch-checkpoints
+      --sglang-moe-a2a-backend deepep
+      --sglang-deepep-mode auto
+      --sglang-dsa-prefill-backend tilelang
+      --sglang-dsa-decode-backend tilelang
+      --sglang-kv-cache-dtype bfloat16
+      --sglang-moe-runner-backend deep_gemm
+      --sglang-disable-shared-experts-fusion
+      --sglang-mem-fraction-static 0.54
+    )
     ;;
   tiny)
     GLM53_NUM_LAYERS=5
@@ -42,6 +64,9 @@ case "${GLM53_FLASH_PROFILE}" in
     GLM53_INDEX_HEAD_DIM=64
     GLM53_INDEX_TOPK=64
     GLM53_OPTIMIZED_MOE_ARGS=()
+    GLM53_SYNC_ARGS=()
+    GLM53_TRANSFORMER_ARGS=(--transformer-impl local)
+    GLM53_SGLANG_ARGS=()
     ;;
   *)
     echo "Unsupported GLM53_FLASH_PROFILE=${GLM53_FLASH_PROFILE}; expected full or tiny" >&2
@@ -96,6 +121,9 @@ MODEL_ARGS=(
   --moe-router-dtype fp32
   --moe-aux-loss-coeff 0
   "${GLM53_OPTIMIZED_MOE_ARGS[@]}"
+  "${GLM53_SYNC_ARGS[@]}"
+  "${GLM53_TRANSFORMER_ARGS[@]}"
+  "${GLM53_SGLANG_ARGS[@]}"
 
   --mtp-num-layers 0
   --freeze-indexer
