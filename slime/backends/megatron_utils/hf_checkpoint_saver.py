@@ -82,6 +82,8 @@ def save_hf_model_to_path(
     if dist.is_available() and dist.is_initialized():
         dist.broadcast_object_list(payload, src=0)
     model_name, quantization_config = payload[0]
+    if is_save_rank and "glm5next" in model_name.lower().replace("_", "").replace("-", ""):
+        _normalize_glm5_next_training_config(path)
 
     hf_weight_iterator = HfWeightIteratorDirect(
         args=args,
@@ -101,6 +103,7 @@ def save_hf_model_to_path(
 
     writer = _SafetensorShardWriter(path, enabled=is_writer_rank)
     pending_write = None
+    next_shard_idx = 0
 
     for chunk_idx, hf_named_tensors in enumerate(
         hf_weight_iterator.get_hf_weight_chunks(
@@ -115,6 +118,7 @@ def save_hf_model_to_path(
             should_convert_chunk=lambda _idx: is_writer_rank,
         )
     ):
+        next_shard_idx = chunk_idx + 1
         if is_writer_rank and chunk_idx % num_save_nodes == save_node_rank:
             pending_write = (chunk_idx, hf_named_tensors)
             hf_named_tensors = None
@@ -125,6 +129,10 @@ def save_hf_model_to_path(
             pending_write = _write_pending_chunk(writer, pending_write)
 
     pending_write = _write_pending_chunk(writer, pending_write)
+    if is_save_rank and "glm5next" in model_name.lower().replace("_", "").replace("-", ""):
+        for frozen_tensors in _iter_source_tensor_shards(hf_checkpoint, prefix="model.visual."):
+            writer.write(frozen_tensors, shard_idx=next_shard_idx)
+            next_shard_idx += 1
     _finalize_distributed_shards(path, writer.state())
 
     if is_save_rank:
@@ -310,6 +318,31 @@ def _tensor_for_safetensors(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _iter_source_tensor_shards(checkpoint: Path, *, prefix: str):
+    """Yield prefixed source tensors one original shard at a time.
+
+    GLM-5.3's visual tower is frozen and deliberately absent from Megatron's
+    optimizer/DDP state. Preserve the exact source tensors (including any FP8
+    scale tensors) without loading the language checkpoint or the whole visual
+    tower into host memory at once.
+    """
+    from safetensors import safe_open
+
+    from .hf_to_megatron.common import SafetensorReader
+
+    reader = SafetensorReader(checkpoint)
+    names_by_file: dict[str, list[str]] = {}
+    for name, filename in reader.weight_map.items():
+        if name.startswith(prefix):
+            names_by_file.setdefault(filename, []).append(name)
+    if not names_by_file:
+        raise RuntimeError(f"No {prefix} tensors found in source checkpoint {checkpoint}")
+
+    for filename in sorted(names_by_file):
+        with safe_open(checkpoint / filename, framework="pt", device="cpu") as shard:
+            yield [(name, shard.get_tensor(name)) for name in sorted(names_by_file[filename])]
+
+
 def _clear_existing_hf_weights(path: Path) -> None:
     for item in path.iterdir():
         if item.is_file() and _is_hf_weight_file(item):
@@ -326,6 +359,19 @@ def _copy_hf_assets(origin_hf_dir: str, output_dir: Path) -> None:
             if _is_hf_weight_file(item):
                 continue
             shutil.copy2(item, output_dir / item.name)
+
+
+def _normalize_glm5_next_training_config(path: Path) -> None:
+    """Make a backbone-only training export self-consistent after dropping MTP."""
+    config_path = path / "config.json"
+    with config_path.open(encoding="utf-8") as stream:
+        config = json.load(stream)
+    text = config.get("text_config", config)
+    text["num_nextn_predict_layers"] = 0
+    text["index_share_for_mtp_iteration"] = False
+    with config_path.open("w", encoding="utf-8") as stream:
+        json.dump(config, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
 
 
 def _is_hf_weight_file(path: Path) -> bool:

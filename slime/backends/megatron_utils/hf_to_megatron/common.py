@@ -44,16 +44,16 @@ class SafetensorReader:
             scale_file = self.weight_map[scale_name]
             if scale_file not in self._files:
                 self._files[scale_file] = safe_open(self.path / scale_file, framework="pt", device="cpu")
-            scale = self._files[scale_file].get_tensor(scale_name).to(torch.bfloat16)
+            scale = self._files[scale_file].get_tensor(scale_name).float()
             rows, columns = tensor.shape
             block_rows, block_columns = scale.shape
             tensor = F.pad(
-                tensor.to(torch.bfloat16),
+                tensor.float(),
                 (0, block_columns * 128 - columns, 0, block_rows * 128 - rows),
             )
             tensor = tensor.view(block_rows, 128, block_columns, 128)
             tensor.mul_(scale[:, None, :, None])
-            tensor = tensor.reshape(block_rows * 128, block_columns * 128)[:rows, :columns]
+            tensor = tensor.reshape(block_rows * 128, block_columns * 128)[:rows, :columns].to(torch.bfloat16)
         return tensor
 
 
@@ -94,6 +94,13 @@ def _tensor_parallel_shard(
 ) -> torch.Tensor:
     if parallel_size == 1:
         return tensor
+
+    if name.endswith("self_attention.kda.conv1d.weight") and partition_dim == 0:
+        q_conv, k_conv, v_conv = tensor.chunk(3, dim=0)
+        return torch.cat(
+            [torch.chunk(value, parallel_size, dim=0)[parallel_rank] for value in (q_conv, k_conv, v_conv)],
+            dim=0,
+        ).contiguous()
 
     if "linear_fc1.weight" in name or "linear_fc1.bias" in name:
         gate, up = tensor.chunk(2, dim=partition_dim)

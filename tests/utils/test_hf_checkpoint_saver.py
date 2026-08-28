@@ -10,6 +10,7 @@ from slime.backends.megatron_utils.hf_checkpoint_saver import (
     _clear_existing_hf_weights,
     _copy_hf_assets,
     _finalize_local_shards,
+    _normalize_glm5_next_training_config,
     _SafetensorShardWriter,
     _write_pending_chunk,
     save_hf_model_to_path,
@@ -52,6 +53,23 @@ def test_clear_existing_hf_weights_removes_old_weight_files_only(tmp_path: Path)
     assert not (tmp_path / "model.safetensors.index.json").exists()
     assert not (tmp_path / "model-00001-of-00001.safetensors").exists()
     assert not (tmp_path / "pytorch_model.bin").exists()
+
+
+def test_glm53_training_export_disables_unwritten_mtp(tmp_path: Path):
+    config = {
+        "model_type": "glm5_next",
+        "text_config": {
+            "num_nextn_predict_layers": 1,
+            "index_share_for_mtp_iteration": True,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    _normalize_glm5_next_training_config(tmp_path)
+
+    normalized = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert normalized["text_config"]["num_nextn_predict_layers"] == 0
+    assert normalized["text_config"]["index_share_for_mtp_iteration"] is False
 
 
 def test_save_hf_model_to_path_rejects_origin_checkpoint(tmp_path: Path):
