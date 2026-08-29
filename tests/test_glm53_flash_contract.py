@@ -92,6 +92,18 @@ def test_glm53_image_build_honors_bounded_parallelism():
     assert "MAX_JOBS=96" not in dockerfile
 
 
+def test_glm53_runtime_probe_defaults_match_dependency_lock():
+    lock = dict(
+        line.split("=", 1)
+        for line in (REPO_ROOT / "docker/glm53-flash.lock").read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    )
+    probe = (REPO_ROOT / "scripts/probe-glm5.3-flash-runtime.py").read_text(encoding="utf-8")
+
+    assert f'EXPECTED_MEGATRON_COMMIT = "{lock["MEGATRON_COMMIT"]}"' in probe
+    assert f'EXPECTED_SGLANG_COMMIT = "{lock["SGLANG_COMMIT"]}"' in probe
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

@@ -18,8 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-EXPECTED_MEGATRON_COMMIT = "734716a48bb0291c20b60bf44271cc6bf4474f02"
-EXPECTED_SGLANG_COMMIT = "3477cbec5128af180cbd6abeefb657cf59866ac2"
+EXPECTED_MEGATRON_COMMIT = "15e885973f94d72a1ae2365761b4ec4f32176e1a"
+EXPECTED_SGLANG_COMMIT = "a935cba7215930d551b416e963a7bb14872e5af6"
 EXPECTED_SLIME_REPOSITORY = "https://github.com/imvladikon/slime.git"
 EXPECTED_MEGATRON_REPOSITORY = "https://github.com/imvladikon/Megatron-LM.git"
 EXPECTED_SGLANG_REPOSITORY = "https://github.com/imvladikon/sglang.git"
