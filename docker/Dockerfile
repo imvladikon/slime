@@ -20,6 +20,7 @@ ARG TMS_COMMIT=8d30c59ca12a68d9deccbc9c6599076a1218cbc5
 
 ARG TMS_CUDA_MAJOR=
 ARG BUILD_MAX_JOBS=8
+ARG BUILD_NVCC_THREADS=1
 
 # ======================================== Setup =============================================
 
@@ -51,11 +52,11 @@ RUN apt install -y nvtop rsync dnsutils prometheus protobuf-compiler
 # SGLang instead of replacing its Blackwell inference kernels with FA2.
 RUN if [ "$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" = "12" ]; then \
       pip uninstall -y flash-attn-4 flash_attn_4 || true; \
-      MAX_JOBS=64 pip -v install flash-attn==2.8.3 --no-build-isolation; \
+      MAX_JOBS="${BUILD_MAX_JOBS}" pip -v install flash-attn==2.8.3 --no-build-isolation; \
       git clone https://github.com/Dao-AILab/flash-attention.git && \
       cd flash-attention/ && git checkout 002cce0a1068f8c07dfccb5a1d232b9a3276947c && git submodule update --init && \
       cd hopper/ && \
-      FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=96 pip -v install . --no-build-isolation && \
+      FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS="${BUILD_MAX_JOBS}" pip -v install . --no-build-isolation && \
       cd /root/ && rm -rf flash-attention/; \
     fi
 
@@ -81,10 +82,10 @@ RUN if [ "$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" 
       pip -v install --no-build-isolation "transformer_engine[pytorch]==2.16.1"; \
     fi
 
-RUN NVCC_APPEND_FLAGS="--threads 4" \
+RUN MAX_JOBS="${BUILD_MAX_JOBS}" NVCC_APPEND_FLAGS="--threads ${BUILD_NVCC_THREADS}" \
   pip -v install --disable-pip-version-check --no-cache-dir \
   --no-build-isolation \
-  --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
+  --config-settings "--build-option=--cpp_ext --cuda_ext --parallel ${BUILD_MAX_JOBS}" git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
 
 RUN git clone "${MEGATRON_REPOSITORY}" Megatron-LM --recursive && \
     cd Megatron-LM && git checkout ${MEGATRON_COMMIT} && \
@@ -134,7 +135,7 @@ RUN if [ "$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" 
         export CPATH="/usr/local/cuda/include/cccl${CPATH:+:$CPATH}"; \
         export NVCC_PREPEND_FLAGS="-I/usr/local/cuda/include/cccl ${NVCC_PREPEND_FLAGS:-}"; \
       fi && \
-      TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS=64 python setup.py bdist_wheel && \
+      TORCH_CUDA_ARCH_LIST="${CUDA_ARCHS}" MAX_JOBS="${BUILD_MAX_JOBS}" python setup.py bdist_wheel && \
       pip install --force-reinstall --no-deps dist/deep_ep-*.whl && \
       cd /root/ && rm -rf DeepEP; \
     fi

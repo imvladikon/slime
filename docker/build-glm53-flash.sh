@@ -32,7 +32,8 @@ docker build \
   --build-arg "DEEPEP_CUDA_ARCH_LIST=${DEEPEP_CUDA_ARCH_LIST}" \
   --build-arg "DEEPEP_PACKAGE_VERSION=${DEEPEP_PACKAGE_VERSION}" \
   --build-arg "DEEPGEMM_PACKAGE_VERSION=${DEEPGEMM_PACKAGE_VERSION}" \
-  --build-arg "BUILD_MAX_JOBS=${BUILD_MAX_JOBS:-8}" \
+  --build-arg "BUILD_MAX_JOBS=${BUILD_MAX_JOBS:-2}" \
+  --build-arg "BUILD_NVCC_THREADS=${BUILD_NVCC_THREADS:-1}" \
   --build-arg ENABLE_MEGATRON_PATCH=0 \
   --build-arg ENABLE_SGLANG_PATCH=0 \
   "${REPO_ROOT}"

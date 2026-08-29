@@ -79,6 +79,19 @@ def test_glm53_image_builds_gateway_from_pinned_sglang_source():
     assert "zhuzilin/sgl-router" not in dockerfile
 
 
+def test_glm53_image_build_honors_bounded_parallelism():
+    dockerfile = (REPO_ROOT / "docker/Dockerfile").read_text(encoding="utf-8")
+    build_script = (REPO_ROOT / "docker/build-glm53-flash.sh").read_text(encoding="utf-8")
+
+    assert 'MAX_JOBS="${BUILD_MAX_JOBS}"' in dockerfile
+    assert 'NVCC_APPEND_FLAGS="--threads ${BUILD_NVCC_THREADS}"' in dockerfile
+    assert "--parallel ${BUILD_MAX_JOBS}" in dockerfile
+    assert 'BUILD_MAX_JOBS=${BUILD_MAX_JOBS:-2}' in build_script
+    assert 'BUILD_NVCC_THREADS=${BUILD_NVCC_THREADS:-1}' in build_script
+    assert "MAX_JOBS=64" not in dockerfile
+    assert "MAX_JOBS=96" not in dockerfile
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
