@@ -19,6 +19,7 @@ ARG TRANSFORMER_ENGINE_CUDA_ARCHS=90;100a;103a
 ARG TMS_COMMIT=8d30c59ca12a68d9deccbc9c6599076a1218cbc5
 
 ARG TMS_CUDA_MAJOR=
+ARG BUILD_MAX_JOBS=8
 
 # ======================================== Setup =============================================
 
@@ -73,7 +74,7 @@ RUN if [ "$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" 
 # toolkit.  Build TE against the base image's libraries on CUDA 13; retain the
 # validated wheel path for CUDA 12.
 RUN if [ "$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" = "13" ]; then \
-      NVTE_CUDA_ARCHS="${TRANSFORMER_ENGINE_CUDA_ARCHS}" MAX_JOBS=64 \
+      NVTE_CUDA_ARCHS="${TRANSFORMER_ENGINE_CUDA_ARCHS}" MAX_JOBS="${BUILD_MAX_JOBS}" \
         pip -v install --no-build-isolation \
         git+https://github.com/NVIDIA/TransformerEngine.git@${TRANSFORMER_ENGINE_COMMIT}; \
     else \
@@ -209,17 +210,31 @@ ARG SLIME_COMMIT=main
 COPY . /tmp/slime-source
 RUN if [ "${SLIME_COMMIT}" = "local" ]; then \
       rm -rf /root/slime && \
-      mv /tmp/slime-source /root/slime; \
+      mv /tmp/slime-source /root/slime && \
+      printf '%s\n' local > /root/slime/.source-commit; \
     else \
       rm -rf /tmp/slime-source && \
       git clone "${SLIME_REPOSITORY}" /root/slime && \
       cd /root/slime && \
-      git checkout "${SLIME_COMMIT}"; \
+      git checkout "${SLIME_COMMIT}" && \
+      test "$(git rev-parse HEAD)" = "${SLIME_COMMIT}" && \
+      git rev-parse HEAD > /root/slime/.source-commit; \
     fi && \
     pip install -e /root/slime --no-deps
+
+LABEL org.opencontainers.image.revision="${SLIME_COMMIT}" \
+      ai.zai.glm53-flash.sglang-revision="${SGLANG_COMMIT}" \
+      ai.zai.glm53-flash.megatron-revision="${MEGATRON_COMMIT}"
 
 RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
     pip install . --no-build-isolation
 
 RUN python -c "import torch, sglang, transformer_engine.pytorch; assert torch.version.cuda and torch.version.cuda.split('.')[0] == '13'; assert torch.__version__.split('+')[0].startswith('2.13.')" && \
-    pip check
+    pip check && \
+    python /root/slime/scripts/probe-glm5.3-flash-runtime.py \
+      --expected-slime-commit "${SLIME_COMMIT}" \
+      --expected-megatron-commit "${MEGATRON_COMMIT}" \
+      --expected-sglang-commit "${SGLANG_COMMIT}" \
+      --expected-slime-repository "${SLIME_REPOSITORY}" \
+      --expected-megatron-repository "${MEGATRON_REPOSITORY}" \
+      --expected-sglang-repository "${SGLANG_REPOSITORY}"
