@@ -53,24 +53,58 @@ fi
 check_revision() {
   local name=$1
   local root=$2
-  local expected=$3
+  local expected_repository=$3
+  local expected=$4
   local actual
-  actual=$(git -C "${root}" rev-parse HEAD 2>/dev/null || true)
   local dirty
-  dirty=$(git -C "${root}" status --porcelain 2>/dev/null || true)
-  if [[ "${actual}" != "${expected}" || -n "${dirty}" ]]; then
+  local repository
+  if [[ -e "${root}/.git" ]]; then
+    actual=$(git -C "${root}" rev-parse HEAD 2>/dev/null || true)
+    dirty=$(git -C "${root}" status --porcelain 2>/dev/null || true)
+    repository=$(git -C "${root}" remote get-url fork 2>/dev/null \
+      || git -C "${root}" remote get-url origin 2>/dev/null || true)
+  elif [[ -f "${root}/.source-provenance.json" ]]; then
+    read -r actual repository < <(
+      "${PYTHON_BIN}" - "${root}/.source-provenance.json" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+print(document.get("commit", ""), document.get("repository", ""))
+PY
+    )
+    dirty=
+  else
+    actual=
+    dirty=missing
+    repository=
+  fi
+  local normalized_repository=${repository%.git}
+  normalized_repository=${normalized_repository%/}
+  local normalized_expected_repository=${expected_repository%.git}
+  normalized_expected_repository=${normalized_expected_repository%/}
+  if [[ "${actual}" != "${expected}" || -n "${dirty}" \
+    || "${normalized_repository}" != "${normalized_expected_repository}" ]]; then
     if [[ "${ALLOW_UNPINNED}" = "1" ]]; then
-      echo "WARNING: ${name} is not a clean checkout of ${expected} (HEAD ${actual:-missing})." >&2
+      echo "WARNING: ${name} does not match ${expected_repository}@${expected} " \
+        "(source ${repository:-missing}, HEAD ${actual:-missing}, dirty ${dirty:-false})." >&2
     else
-      echo "${name} must be a clean checkout of ${expected} (HEAD ${actual:-missing})." >&2
+      echo "${name} must match ${expected_repository}@${expected} " \
+        "(source ${repository:-missing}, HEAD ${actual:-missing}, dirty ${dirty:-false})." >&2
       exit 2
     fi
   fi
 }
 
-check_revision Megatron-LM "${MEGATRON_ROOT}" "${MEGATRON_COMMIT}"
+if [[ -n "${GLM53_EXPECTED_SLIME_REPOSITORY:-}" || -n "${GLM53_EXPECTED_SLIME_COMMIT:-}" ]]; then
+  : "${GLM53_EXPECTED_SLIME_REPOSITORY:?Set GLM53_EXPECTED_SLIME_REPOSITORY with GLM53_EXPECTED_SLIME_COMMIT}"
+  : "${GLM53_EXPECTED_SLIME_COMMIT:?Set GLM53_EXPECTED_SLIME_COMMIT with GLM53_EXPECTED_SLIME_REPOSITORY}"
+  check_revision Slime "${REPO_ROOT}" \
+    "${GLM53_EXPECTED_SLIME_REPOSITORY}" "${GLM53_EXPECTED_SLIME_COMMIT}"
+fi
+check_revision Megatron-LM "${MEGATRON_ROOT}" "${MEGATRON_REPOSITORY}" "${MEGATRON_COMMIT}"
 if [[ "${MODE}" != "sft" ]]; then
-  check_revision SGLang "${SGLANG_ROOT}" "${SGLANG_COMMIT}"
+  check_revision SGLang "${SGLANG_ROOT}" "${SGLANG_REPOSITORY}" "${SGLANG_COMMIT}"
 fi
 if [[ "${MODE}" != "rl" ]]; then
   "${PYTHON_BIN}" - "${TINY_CHECKPOINT}" "${TINY_NORMALIZED_MODEL_SHA256}" \
@@ -105,6 +139,11 @@ if provenance.get("normalized_model_sha256") != expected_hash:
 if provenance.get("normalized_config_sha256") != expected_config_hash:
     raise SystemExit("normalized tiny config provenance hash does not match the lock")
 PY
+fi
+
+if [[ "${GLM53_PREFLIGHT_ONLY:-0}" = "1" ]]; then
+  echo "GLM-5.3-Flash source and checkpoint preflight passed."
+  exit 0
 fi
 
 if [[ -d "${OUTPUT_ROOT}" && -n "$(find "${OUTPUT_ROOT}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
@@ -383,12 +422,14 @@ COMMON_ARGS=(
 submit_job() {
   local submission_id=$1
   shift
+  mkdir -p "${OUTPUT_ROOT}/logs"
   ray job submit \
     --address http://127.0.0.1:8265 \
     --submission-id "${submission_id}" \
     --working-dir "${REPO_ROOT}" \
     --runtime-env-json "${RUNTIME_ENV}" \
-    -- "${PYTHON_BIN}" train.py "$@"
+    -- "${PYTHON_BIN}" train.py "$@" \
+    2>&1 | tee "${OUTPUT_ROOT}/logs/${submission_id}.log"
 }
 
 "${PYTHON_BIN}" - "${MANIFEST_PATH}" "${MODE}" "${RUN_ID}" \
@@ -412,13 +453,54 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def git_state(root):
+def source_state(root):
     path = Path(root)
-    if not (path / ".git").exists():
-        return {"path": str(path), "head": None, "dirty": None}
-    head = subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
-    dirty = bool(subprocess.check_output(["git", "-C", str(path), "status", "--porcelain"], text=True))
-    return {"path": str(path), "head": head, "dirty": dirty}
+    if (path / ".git").exists():
+        head = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"], text=True
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "-C", str(path), "status", "--porcelain"], text=True
+            )
+        )
+        repository = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "fork"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if repository.returncode != 0:
+            repository = subprocess.run(
+                ["git", "-C", str(path), "remote", "get-url", "origin"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        return {
+            "path": str(path),
+            "repository": repository.stdout.strip(),
+            "commit": head,
+            "dirty": dirty,
+            "provenance": "git",
+        }
+    provenance_path = path / ".source-provenance.json"
+    if provenance_path.is_file():
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        return {
+            "path": str(path),
+            "repository": provenance.get("repository"),
+            "commit": provenance.get("commit"),
+            "dirty": False,
+            "provenance": "manifest",
+        }
+    return {
+        "path": str(path),
+        "repository": None,
+        "commit": None,
+        "dirty": None,
+        "provenance": "missing",
+    }
 
 
 (
@@ -464,9 +546,9 @@ manifest = {
     "status": "running",
     "exit_code": None,
     "repositories": {
-        "slime": git_state(slime),
-        "megatron": git_state(megatron),
-        "sglang": git_state(sglang),
+        "slime": source_state(slime),
+        "megatron": source_state(megatron),
+        "sglang": source_state(sglang),
     },
     "tiny_checkpoint": tiny or None,
     "sft_hf_checkpoint": sft_hf,
