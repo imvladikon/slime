@@ -60,7 +60,6 @@ RUN if [ "$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')" 
       cd /root/ && rm -rf flash-attention/; \
     fi
 
-RUN pip install flash-linear-attention==0.4.2
 # FlashQLA currently requires TileLang 0.1.9, while SGLang 0.5.15.post1 on
 # CUDA 13 requires 0.1.11.  Keep the existing CUDA 12 installation and use
 # the default FLA backend on CUDA 13 instead of downgrading SGLang's runtime.
@@ -146,8 +145,8 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt
 
-# Megatron currently requires NumPy 1.x, while SciPy 1.18+ requires NumPy 2.x.
-# Pin both packages together so downgrading NumPy does not leave an incompatible SciPy.
+# Keep the image on its qualified NumPy/SciPy pair. Current Megatron also
+# supports NumPy 2.x; this pin is not a runtime compatibility requirement.
 RUN pip install "numpy==1.26.4" "scipy==1.17.1"
 
 # Build the router binding from the same pinned SGLang source as the engine.
