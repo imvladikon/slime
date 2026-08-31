@@ -30,7 +30,11 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 
     from sglang_router.launch_router import RouterArgs
 
+    from slime.backends.sglang_utils.router_compat import patch_sglang_router_r3
     from slime.utils.http_utils import run_router
+
+    if patch_sglang_router_r3():
+        logger.warning("Applied routed-expert merge compatibility to the installed SGLang router")
 
     router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
     router_args.host = router_ip
