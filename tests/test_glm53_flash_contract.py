@@ -104,6 +104,16 @@ def test_glm53_runtime_probe_defaults_match_dependency_lock():
     assert f'EXPECTED_SGLANG_COMMIT = "{lock["SGLANG_COMMIT"]}"' in probe
 
 
+def test_r3_router_tracks_the_glm_sglang_branch():
+    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+    assert (
+        "sglang-router @ "
+        "git+https://github.com/imvladikon/sglang.git@glm-5.3-flash"
+        "#subdirectory=sgl-model-gateway/bindings/python"
+    ) in requirements
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
