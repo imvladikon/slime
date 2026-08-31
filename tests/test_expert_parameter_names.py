@@ -34,7 +34,7 @@ class _LocalExpertModel:
         return []
 
 
-class _EP2LocalExpertModel(_LocalExpertModel):
+class _EPLocalExpertModel(_LocalExpertModel):
     def __init__(self):
         from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -72,16 +72,16 @@ class _TEGroupedExpertModel:
         return []
 
 
-def _run_ep2_metadata_contract(rank, init_method):
+def _run_ep_metadata_contract(rank, world_size, init_method):
     from megatron.core import parallel_state
     from slime.utils.distributed_utils import set_gloo_group
 
-    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2)
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=world_size)
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
-        expert_model_parallel_size=2,
+        expert_model_parallel_size=world_size,
     )
     set_gloo_group(dist.group.WORLD)
     original_all_gather_object = dist.all_gather_object
@@ -95,16 +95,22 @@ def _run_ep2_metadata_contract(rank, init_method):
     dist.all_gather_object = spy_all_gather_object
     try:
         infos = _get_megatron_local_param_infos(
-            SimpleNamespace(num_experts=2), [_EP2LocalExpertModel()]
+            SimpleNamespace(num_experts=world_size), [_EPLocalExpertModel()]
         )
         by_name = {info.name: info for info in infos}
         dense_name = "module.module.decoder.final_layernorm.weight"
         fc1 = "module.module.decoder.layers.3.mlp.experts.linear_fc1.weight"
         fc2 = "module.module.decoder.layers.3.mlp.experts.linear_fc2.weight"
-        assert set(by_name) == {dense_name, fc1 + "0", fc1 + "1", fc2 + "0", fc2 + "1"}
+        expert_names = {
+            f"{prefix}{expert}"
+            for prefix in (fc1, fc2)
+            for expert in range(world_size)
+        }
+        assert set(by_name) == {dense_name, *expert_names}
         assert by_name[dense_name].src_rank == rank
-        assert by_name[fc1 + "0"].src_rank == by_name[fc2 + "0"].src_rank == 0
-        assert by_name[fc1 + "1"].src_rank == by_name[fc2 + "1"].src_rank == 1
+        for expert in range(world_size):
+            assert by_name[fc1 + str(expert)].src_rank == expert
+            assert by_name[fc2 + str(expert)].src_rank == expert
         assert len(ep_payloads) == 1
         assert ep_payloads[0]
         assert all(".experts." in name for name in ep_payloads[0])
@@ -274,6 +280,12 @@ def test_ep_metadata_exchange_rejects_duplicate_expert_owners(monkeypatch):
         _get_megatron_local_param_infos(SimpleNamespace(), [object()])
 
 
-def test_real_gloo_ep2_metadata_contract(tmp_path):
-    init_method = f"file://{tmp_path / 'ep2-init'}"
-    mp.spawn(_run_ep2_metadata_contract, args=(init_method,), nprocs=2, join=True)
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_real_gloo_ep_metadata_contract(tmp_path, world_size):
+    init_method = f"file://{tmp_path / f'ep{world_size}-init'}"
+    mp.spawn(
+        _run_ep_metadata_contract,
+        args=(world_size, init_method),
+        nprocs=world_size,
+        join=True,
+    )
