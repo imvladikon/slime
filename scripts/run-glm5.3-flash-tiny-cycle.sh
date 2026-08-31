@@ -36,6 +36,8 @@ RL_HF_ORACLE=${OUTPUT_ROOT}/rl-hf_1
 RL_HF_OFFLINE=${OUTPUT_ROOT}/rl-hf-offline
 ALLOW_UNPINNED=${GLM53_ALLOW_UNPINNED:-0}
 ALLOW_EXISTING_OUTPUT=${GLM53_ALLOW_EXISTING_OUTPUT:-0}
+SGLANG_MEM_FRACTION_STATIC=${GLM53_SGLANG_MEM_FRACTION_STATIC:-0.45}
+SGLANG_MAX_TOTAL_TOKENS=${GLM53_SGLANG_MAX_TOTAL_TOKENS:-512}
 
 if [[ "${MODE}" != "rl" && ( -z "${TINY_CHECKPOINT}" || ! -f "${TINY_CHECKPOINT}/model.safetensors" ) ]]; then
   echo "Set GLM53_TINY_CHECKPOINT to the normalized tiny checkpoint directory." >&2
@@ -670,9 +672,9 @@ if [[ "${MODE}" = "rl" || "${MODE}" = "all" ]]; then
     --rollout-max-prompt-len 96 \
     --rollout-max-response-len 8 \
     --rollout-temperature 1 \
-    --sglang-mem-fraction-static 0.45 \
+    --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}" \
     --sglang-max-running-requests 2 \
-    --sglang-max-total-tokens 512 \
+    --sglang-max-total-tokens "${SGLANG_MAX_TOTAL_TOKENS}" \
     --sglang-chunked-prefill-size 64 \
     --sglang-page-size 64 \
     --sglang-attention-backend dsa \
