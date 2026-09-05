@@ -1,4 +1,5 @@
-import dataclasses
+import hashlib
+import re
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 
@@ -11,7 +12,7 @@ from slime.utils import accelerator
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.types import ParamInfo
 
-from ..megatron_to_hf import convert_to_hf
+from ..megatron_to_hf import conversion_cache_scope, convert_to_hf
 from ..sglang import monkey_patch_torch_reductions
 from .common import all_gather_params_async, named_params_and_buffers
 
@@ -37,18 +38,23 @@ class HfWeightIteratorDirect:
             self.megatron_local_param_info_buckets if param_info_buckets is None else param_info_buckets
         )
 
-        for chunk_idx, megatron_local_param_infos in enumerate(
-            tqdm(param_info_buckets, disable=rank != 0, desc=progress_desc)
-        ):
-            megatron_full_params = _get_megatron_full_params(megatron_local_param_infos, megatron_local_weights)
-            if should_convert_chunk is None or should_convert_chunk(chunk_idx):
-                hf_named_tensors = self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
-            else:
-                hf_named_tensors = []
-            try:
-                yield hf_named_tensors
-            finally:
-                del hf_named_tensors, megatron_full_params
+        with conversion_cache_scope():
+            for chunk_idx, megatron_local_param_infos in enumerate(
+                tqdm(param_info_buckets, disable=rank != 0, desc=progress_desc)
+            ):
+                megatron_full_params = _get_megatron_full_params(
+                    megatron_local_param_infos, megatron_local_weights
+                )
+                if should_convert_chunk is None or should_convert_chunk(chunk_idx):
+                    hf_named_tensors = self._convert_to_hf_named_tensors(
+                        megatron_full_params, megatron_local_param_infos
+                    )
+                else:
+                    hf_named_tensors = []
+                try:
+                    yield hf_named_tensors
+                finally:
+                    del hf_named_tensors, megatron_full_params
 
     def _convert_to_hf_named_tensors(
         self,
@@ -146,43 +152,80 @@ def pack_param_info_buckets(
     param_infos: Sequence[ParamInfo],
     update_weight_buffer_size: int,
 ) -> list[list[ParamInfo]]:
+    grouped: dict[str, list[ParamInfo]] = {}
+    group_order: list[str] = []
+    for info in param_infos:
+        key = _conversion_group_key(info.name)
+        if key not in grouped:
+            grouped[key] = []
+            group_order.append(key)
+        grouped[key].append(info)
+
     param_info_buckets = [[]]  # Start with one empty bucket
     buffer_size = 0  # Track current bucket size in bytes
 
-    for info in param_infos:
-        # Expert params use expert-TP size, others use regular-TP size
-        if ".experts." in info.name:
-            tp_size = mpu.get_expert_tensor_parallel_world_size()
-        else:
-            tp_size = mpu.get_tensor_model_parallel_world_size()
+    for key in group_order:
+        infos = grouped[key]
+        group_size = 0
+        for info in infos:
+            tp_size = (
+                mpu.get_expert_tensor_parallel_world_size()
+                if ".experts." in info.name
+                else mpu.get_tensor_model_parallel_world_size()
+            )
+            group_size += info.size * tp_size
 
-        # Full param size = shard size × TP replicas (all-gather will reconstruct full param)
-        param_size = info.size * tp_size
-
-        # If adding this param exceeds limit AND current bucket has params: start new bucket
-        if buffer_size + param_size > update_weight_buffer_size and len(param_info_buckets[-1]) > 0:
+        if buffer_size + group_size > update_weight_buffer_size and param_info_buckets[-1]:
             param_info_buckets.append([])
             buffer_size = 0
-
-        # Add param to current bucket and update size
-        param_info_buckets[-1].append(info)
-        buffer_size += param_size
+        param_info_buckets[-1].extend(infos)
+        buffer_size += group_size
 
     return param_info_buckets
+
+
+_LAYER_PARAMETER = re.compile(
+    r"((?:module\.)*(?:language_model\.)?decoder\.layers\.\d+)\.(.+)"
+)
+
+
+def _conversion_group_key(name: str) -> str:
+    match = _LAYER_PARAMETER.fullmatch(name)
+    if not match:
+        return name
+    layer, rest = match.groups()
+    if rest in {
+        "self_attention.linear_q_down_proj.weight",
+        "self_attention.linear_kv_down_proj.weight",
+    }:
+        return f"{layer}.self_attention.q_kv_down_pair"
+    alpha = re.fullmatch(
+        r"(self_attention_hyper_connection|mlp_hyper_connection)\.alpha_(?:pre|post|res)",
+        rest,
+    )
+    if alpha:
+        return f"{layer}.{alpha.group(1)}.alpha_group"
+    return name
 
 
 def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Module]) -> list[ParamInfo]:
     """
     Build global param metadata: collect → exchange PP/EP → resolve duplicates (MTP virtual PP)
-    by min src_rank → validate. Returns sorted ParamInfo identical across all ranks.
+    by min src_rank → validate. Logical metadata is identical across ranks; src_rank remains
+    the global physical owner and may differ for replicated dense parameters.
     """
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     ep_size = mpu.get_expert_model_parallel_world_size()
 
-    param_infos = {}
+    param_infos: dict[str, ParamInfo] = {}
+    local_parameters: dict[str, torch.Tensor] = {}
     rank = dist.get_rank()
     for name, param in named_params_and_buffers(args, model):
-        param_infos[name] = ParamInfo(
+        previous = local_parameters.get(name)
+        if previous is not None and previous is not param:
+            raise RuntimeError(f"Distinct local parameters canonicalize to the same name: {name}")
+        local_parameters[name] = param
+        info = ParamInfo(
             name=name,
             dtype=param.dtype,
             shape=param.shape,
@@ -195,6 +238,7 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
             size=param.numel() * param.element_size(),
             src_rank=rank,
         )
+        _merge_param_info(param_infos, info, reject_distinct_owner=False)
 
     if pp_size > 1:
         param_infos_list = [None] * pp_size
@@ -204,44 +248,82 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
         for src_rank, infos in param_infos_list:
             if src_rank == rank:
                 continue
-            for name, info in infos.items():
-                if name in param_infos:
-                    old_info = param_infos[name]
-                    if old_info.src_rank > src_rank:
-                        param_infos[name] = info
-                else:
-                    param_infos[name] = info
+            for _name, info in infos.items():
+                _merge_param_info(param_infos, info, reject_distinct_owner=False)
 
     if ep_size > 1:
+        local_expert_infos = {name: info for name, info in param_infos.items() if ".experts." in name}
         param_infos_list = [None] * ep_size
         dist.all_gather_object(
-            obj=(rank, param_infos), object_list=param_infos_list, group=mpu.get_expert_model_parallel_group()
+            obj=(rank, local_expert_infos),
+            object_list=param_infos_list,
+            group=mpu.get_expert_model_parallel_group(),
         )
-        for src_rank, infos in param_infos_list:
-            for name, info in infos.items():
-                if name not in param_infos:
-                    # here we need to set the src_rank to the rank within the expert model parallel group
-                    info = dataclasses.replace(info, src_rank=src_rank)
-                    param_infos[name] = info
+        for _src_rank, infos in param_infos_list:
+            for info in infos.values():
+                _merge_param_info(param_infos, info, reject_distinct_owner=True)
 
     param_infos = list(param_infos.values())
     param_infos = sorted(param_infos, key=lambda info: info.name)
 
-    # Check all ranks has the same parameter info
-    all_param_info_list = [None] * dist.get_world_size()
-    dist.all_gather_object(
-        obj=param_infos,
-        object_list=all_param_info_list,
-        group=get_gloo_group(),
-    )
-    for i, param_info in enumerate(param_infos):
-        for infos in all_param_info_list:
-            assert infos[i].name == param_info.name, f"Parameter name mismatch: {infos[i].name} != {param_info.name}"
-            assert (
-                infos[i].shape == param_info.shape
-            ), f"Parameter shape mismatch: {infos[i].shape} != {param_info.shape}"
-            assert (
-                infos[i].dtype == param_info.dtype
-            ), f"Parameter dtype mismatch: {infos[i].dtype} != {param_info.dtype}"
+    _validate_param_infos_consistent(param_infos)
 
     return param_infos
+
+
+def _param_info_metadata(info: ParamInfo) -> tuple:
+    attrs = tuple(
+        (str(key), type(value).__qualname__, repr(value))
+        for key, value in sorted(info.attrs.items(), key=lambda item: str(item[0]))
+    )
+    return info.name, str(info.dtype), tuple(info.shape), info.size, attrs
+
+
+def _merge_param_info(
+    param_infos: dict[str, ParamInfo],
+    info: ParamInfo,
+    *,
+    reject_distinct_owner: bool,
+) -> None:
+    """Merge logical metadata while preserving global physical source ranks."""
+    old_info = param_infos.get(info.name)
+    if old_info is None:
+        param_infos[info.name] = info
+        return
+    if _param_info_metadata(old_info) != _param_info_metadata(info):
+        raise RuntimeError(
+            f"Parameter metadata mismatch for {info.name}: "
+            f"owner {old_info.src_rank} != owner {info.src_rank}"
+        )
+    if reject_distinct_owner and old_info.src_rank != info.src_rank:
+        raise RuntimeError(
+            f"Routed expert {info.name} has multiple physical owners: "
+            f"{old_info.src_rank} and {info.src_rank}"
+        )
+    if info.src_rank < old_info.src_rank:
+        param_infos[info.name] = info
+
+
+def _param_info_fingerprint(param_infos: Sequence[ParamInfo]) -> tuple[int, str]:
+    """Return constant-size metadata for the cross-world consistency check."""
+    digest = hashlib.sha256()
+    for info in param_infos:
+        for value in _param_info_metadata(info):
+            value = repr(value)
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "little"))
+            digest.update(encoded)
+    return len(param_infos), digest.hexdigest()
+
+
+def _validate_param_infos_consistent(param_infos: Sequence[ParamInfo]) -> None:
+    """Check global metadata without replicating every ParamInfo on every rank."""
+    local = _param_info_fingerprint(param_infos)
+    fingerprints = [None] * dist.get_world_size()
+    dist.all_gather_object(
+        obj=local,
+        object_list=fingerprints,
+        group=get_gloo_group(),
+    )
+    if any(fingerprint != local for fingerprint in fingerprints):
+        raise RuntimeError(f"Parameter metadata mismatch across ranks: local={local}, gathered={fingerprints}")

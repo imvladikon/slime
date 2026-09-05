@@ -182,6 +182,35 @@ class UpdateWeightFromTensor:
             engine_parallel_configs=colocate_parallel_configs,
             use_distribute=self.use_distribute,
         )
+        expert_source_bytes = sum(
+            sum(param.info.size for param in transfer.params)
+            for group in self._expert_transfer_plan
+            for batch in group
+            for transfer in batch
+        )
+        expert_target_bytes = sum(
+            sum(param.info.size for param in transfer.params) * len(transfer.target_ranks)
+            for group in self._expert_transfer_plan
+            for batch in group
+            for transfer in batch
+        )
+        expert_source_bytes_by_rank: dict[int, int] = defaultdict(int)
+        for group in self._expert_transfer_plan:
+            for batch in group:
+                for transfer in batch:
+                    expert_source_bytes_by_rank[transfer.source_rank] += sum(
+                        param.info.size for param in transfer.params
+                    )
+        self.update_weight_metrics.update(
+            {
+                "rank_local_expert_update": float(bool(self._expert_transfer_plan)),
+                "rank_local_expert_planned_source_bytes": float(expert_source_bytes),
+                "rank_local_expert_planned_target_bytes": float(expert_target_bytes),
+                "rank_local_expert_max_source_rank_bytes": float(
+                    max(expert_source_bytes_by_rank.values(), default=0)
+                ),
+            }
+        )
 
     def pop_metrics(self) -> dict[str, float]:
         """

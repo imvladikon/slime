@@ -34,6 +34,8 @@ export MEGATRON_COMMIT="1dcf0dafa884ad52ffb243625717a3471643e087"
 export PATCH_VERSION="v0.5.15.post1"
 export TMS_COMMIT="8d30c59ca12a68d9deccbc9c6599076a1218cbc5"
 export FLASH_QLA_COMMIT="821fd9d37ede18fdc2a4e707fefe3770bfc32e58"
+export BUILD_MAX_JOBS="${BUILD_MAX_JOBS:-2}"
+export BUILD_NVCC_THREADS="${BUILD_NVCC_THREADS:-1}"
 
 export BASE_DIR=${BASE_DIR:-"/root"}
 cd $BASE_DIR
@@ -133,10 +135,10 @@ pip install tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 
 pip install --no-build-isolation "transformer_engine[pytorch]==2.16.1"
 
-NVCC_APPEND_FLAGS="--threads 4" \
+MAX_JOBS="${BUILD_MAX_JOBS}" NVCC_APPEND_FLAGS="--threads ${BUILD_NVCC_THREADS}" \
   pip -v install --disable-pip-version-check --no-cache-dir \
   --no-build-isolation \
-  --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
+  --config-settings "--build-option=--cpp_ext --cuda_ext --parallel ${BUILD_MAX_JOBS}" git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
 
 TMS_CUDA_MAJOR="${TMS_CUDA_MAJOR:-$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')}"
 export TMS_CUDA_MAJOR

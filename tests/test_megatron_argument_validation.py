@@ -111,6 +111,25 @@ def make_allgather_cp_args(**overrides):
     return types.SimpleNamespace(**values)
 
 
+def make_megatron_defaults_args(**overrides):
+    values = dict(
+        disable_distributed_optimizer=False,
+        world_size=1,
+        fp16=False,
+        seq_length=128,
+        max_position_embeddings=128,
+        rope_type="rope",
+        multi_latent_attention=False,
+        vocab_size=None,
+        padded_vocab_size=None,
+        tokenizer_model="tokenizer",
+        tokenizer_type="HuggingFaceTokenizer",
+        hf_checkpoint="/tmp/hf",
+    )
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
 @pytest.mark.unit
 def test_hf_validate_all_moe_skips_dense_intermediate_size(monkeypatch):
     module = load_arguments_module(monkeypatch)
@@ -166,6 +185,25 @@ def test_allgather_cp_ignores_cp_size_one(monkeypatch):
     args = make_allgather_cp_args(context_parallel_size=1)
 
     module._validate_allgather_cp_supported(args)
+
+
+@pytest.mark.unit
+def test_single_rank_can_disable_distributed_optimizer(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_megatron_defaults_args(disable_distributed_optimizer=True)
+
+    module._set_default_megatron_args(args)
+
+    assert args.use_distributed_optimizer is False
+
+
+@pytest.mark.unit
+def test_disabling_distributed_optimizer_rejects_multiple_ranks(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_megatron_defaults_args(disable_distributed_optimizer=True, world_size=2)
+
+    with pytest.raises(ValueError, match="single training rank"):
+        module._set_default_megatron_args(args)
 
 
 @pytest.mark.unit
@@ -401,6 +439,49 @@ def test_force_fp8_ue8m0_scale_argument(monkeypatch):
 
     assert defaults.force_fp8_ue8m0_scale is False
     assert configured.force_fp8_ue8m0_scale is True
+
+
+@pytest.mark.unit
+def test_weight_checker_skip_prefix_argument_is_repeatable(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    module.get_slime_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    configured = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--weight-checker-skip-prefix",
+            "visual.",
+            "--weight-checker-skip-prefix",
+            "audio.",
+        ]
+    )
+
+    assert defaults.weight_checker_skip_prefix == []
+    assert configured.weight_checker_skip_prefix == ["visual.", "audio."]
+    assert defaults.weight_checker_frozen_prefix == []
+
+
+@pytest.mark.unit
+def test_weight_checker_frozen_prefix_argument_is_repeatable(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    module.get_slime_extra_args_provider()(parser)
+
+    configured = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--weight-checker-frozen-prefix",
+            "visual.",
+            "--weight-checker-frozen-prefix",
+            "audio.",
+        ]
+    )
+
+    assert configured.weight_checker_frozen_prefix == ["visual.", "audio."]
 
 
 if __name__ == "__main__":

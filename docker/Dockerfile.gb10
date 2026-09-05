@@ -184,7 +184,7 @@ RUN pip install --no-deps --no-build-isolation "nvidia-modelopt>=0.37.0"
 # with "Could not deserialize ATN with version 3 (expected 4)".
 RUN pip install --no-deps "antlr4-python3-runtime==4.9.3" omegaconf wandb
 
-# Megatron requires numpy 1.x; NGC ships 2.x.
+# Keep the GB10 image on its qualified NumPy 1.x runtime; current Megatron also supports NumPy 2.x.
 RUN PIP_CONSTRAINT= pip install --no-deps --force-reinstall "numpy<2"
 
 # Reward function runtime deps (grade_answer_verl / deepscaler math verifier)

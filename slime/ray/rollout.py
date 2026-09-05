@@ -248,8 +248,18 @@ class RolloutManager:
         for monitor in self._health_monitors:
             monitor.resume()
 
-    def check_weights(self, action: str):
-        return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
+    def check_weights(self, action: str, skip_prefixes: list[str] | None = None):
+        if skip_prefixes is None:
+            skip_prefixes = getattr(self.args, "weight_checker_skip_prefix", [])
+        return ray.get(
+            [
+                engine.check_weights.remote(
+                    action=action,
+                    skip_prefixes=skip_prefixes,
+                )
+                for engine in self.rollout_engines
+            ]
+        )
 
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:

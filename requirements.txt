@@ -4,6 +4,7 @@ blake3
 blobfile
 datasets
 e2b
+flash-linear-attention==0.4.2
 httpx[http2]
 mcp[cli]
 memray  # needed for debugging (but is lightweight), we can put it to dev mode when using pyproject.toml
@@ -17,7 +18,7 @@ pyyaml
 qwen_vl_utils # for VLM
 ray[default]
 safetensors
-sglang-router>=0.3.0
+sglang-router @ git+https://github.com/imvladikon/sglang.git@glm-5.3-flash#subdirectory=sgl-model-gateway/bindings/python
 tensorboard
 transformers
 wandb
