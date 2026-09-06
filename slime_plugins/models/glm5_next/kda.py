@@ -60,6 +60,11 @@ class Glm5NextKDA(nn.Module):
         tp_size = parallel_state.get_tensor_model_parallel_world_size() if config is not None else 1
         if num_heads % tp_size:
             raise ValueError(f"GLM-5.3 KDA heads={num_heads} must be divisible by TP={tp_size}")
+        if tp_size > 1 and not config.sequence_parallel:
+            raise ValueError(
+                "GLM-5.3 KDA with TP>1 requires sequence_parallel=True: "
+                "Megatron's finalizer must SUM the shared o_norm gradient across head partitions"
+            )
         self.tp_size = tp_size
         self.num_heads = num_heads // tp_size
         self.head_dim = head_dim
@@ -155,11 +160,9 @@ class Glm5NextKDA(nn.Module):
         beta = torch.sigmoid(self._linear(self.b_proj, hidden_states).float())
         forget_low_rank = self.f_a_proj(hidden_states)
         gate_low_rank = self.g_a_proj(hidden_states)
-        if self.tp_size > 1:
-            # Forward is an identity; backward sums the contributions from all
-            # head partitions into the replicated low-rank projections.
-            forget_low_rank = tensor_parallel.copy_to_tensor_model_parallel_region(forget_low_rank)
-            gate_low_rank = tensor_parallel.copy_to_tensor_model_parallel_region(gate_low_rank)
+        # The following ColumnParallelLinear projections already SUM their
+        # input gradients over TP (also when their own weights are frozen).
+        # An outer copy-to-TP would sum those global gradients a second time.
         forget = self._linear(self.f_b_proj, forget_low_rank)
         decay = fused_kda_gate(
             forget.unflatten(-1, (self.num_heads, self.head_dim)),

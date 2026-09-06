@@ -166,6 +166,30 @@ tensors stayed bitwise unchanged, and every floating tensor was finite.
 Standard Transformers reloaded both trained results as
 `Glm5NextForConditionalGeneration` with 84,361,950 parameters.
 
+## KDA tensor-parallel gradient gate
+
+KDA with TP greater than one requires `--sequence-parallel`. Its shared
+`o_norm.weight` receives head-local gradients; Megatron's sequence-parallel
+finalizer must sum them before the optimizer. Unsupported TP without SP is
+rejected at construction. PP and CP remain restricted to one in this lane.
+
+The standalone `tests/probes/glm53_kda_tp.py` compares the complete real FLA
+block against an unsharded reference, including input/parameter gradients and
+an FP32-master SGD delta. It also covers frozen `f_b/g_b` weights and packed
+documents. With a working MCore/FLA environment and `CUDA_VISIBLE_DEVICES` set
+to two verified-free GPU UUIDs, run from the repository root:
+
+```bash
+kda_probe_dir=$(mktemp -d)
+torchrun --standalone --nproc-per-node=2 tests/probes/glm53_kda_tp.py \
+  --slime-root . --output-dir "$kda_probe_dir"
+```
+
+The BF16 block gate was run on two A100s; it is not bitwise TP parity, an
+end-to-end RL test, or qualification of the full model's TP/EP topology.
+The projection-level defect was an extra SUM of already-reduced dgrad, not
+a loss-normalization issue; do not compensate it with a global LR/loss scale.
+
 ## Metadata-only full-scale preflight
 
 Download only config and index metadata. Do not download any full
@@ -279,6 +303,7 @@ and 576 colocated rollout GPUs arranged as 72 engines with TP8/EP8/MoE-DP1:
 --tensor-model-parallel-size 8 --expert-model-parallel-size 72
 --expert-tensor-parallel-size 1 --pipeline-model-parallel-size 1
 --context-parallel-size 1
+--sequence-parallel
 --transformer-impl transformer_engine
 --recompute-granularity selective --recompute-modules mhc moe_act
 --rollout-num-gpus 576 --rollout-num-gpus-per-engine 8

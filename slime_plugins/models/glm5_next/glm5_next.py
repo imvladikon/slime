@@ -122,7 +122,8 @@ def get_glm5_next_spec(args, config, vp_stage=None):
     if int(getattr(config, "pipeline_model_parallel_size", 1)) != 1:
         raise NotImplementedError(
             "The pinned Megatron mHC implementation requires pipeline_model_parallel_size=1; "
-            "scale GLM-5.3 with TP/EP/CP until native mHC pipeline buffers are supported"
+            "this Flash implementation also requires CP=1 for KPool DSA; "
+            "PP/CP scale-out is not implemented"
         )
     use_transformer_engine = getattr(args, "transformer_impl", "transformer_engine") == "transformer_engine"
     block_kwargs = {"use_transformer_engine": use_transformer_engine}

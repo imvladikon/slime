@@ -119,7 +119,8 @@ class Glm5NextDSAAttention(DSAMLASelfAttention):
             raise ValueError("GLM-5.3 DSA requires packed sequence metadata")
         if parallel_state.get_context_parallel_world_size() > 1:
             raise NotImplementedError(
-                "GLM-5.3 KPool DSA currently requires context_parallel_size=1; use TP/PP/EP for production scale"
+                "GLM-5.3 KPool DSA currently requires context_parallel_size=1; "
+                "the Flash mHC spec also requires PP=1; PP/CP scale-out is not implemented"
             )
 
         q_compressed, _ = self.linear_q_down_proj(hidden_states)

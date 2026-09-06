@@ -32,6 +32,7 @@ case "${GLM53_FLASH_PROFILE}" in
     # grouped-MoE activation on Megatron's supported selective path.
     GLM53_TRANSFORMER_ARGS=(
       --transformer-impl transformer_engine
+      --sequence-parallel
       --recompute-granularity selective
       --recompute-modules mhc moe_act
     )
