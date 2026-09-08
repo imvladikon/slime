@@ -38,6 +38,11 @@ ALLOW_UNPINNED=${GLM53_ALLOW_UNPINNED:-0}
 ALLOW_EXISTING_OUTPUT=${GLM53_ALLOW_EXISTING_OUTPUT:-0}
 SGLANG_MEM_FRACTION_STATIC=${GLM53_SGLANG_MEM_FRACTION_STATIC:-0.45}
 SGLANG_MAX_TOTAL_TOKENS=${GLM53_SGLANG_MAX_TOTAL_TOKENS:-512}
+MAX_TOKENS_PER_GPU=${GLM53_MAX_TOKENS_PER_GPU:-256}
+ROLLOUT_OFFLOAD_ARGS=(--no-offload-rollout)
+if [[ "${GLM53_OFFLOAD_ROLLOUT:-0}" == "1" ]]; then
+  ROLLOUT_OFFLOAD_ARGS=(--offload-rollout --sglang-enable-weights-cpu-backup)
+fi
 
 if [[ "${MODE}" != "rl" && ( -z "${TINY_CHECKPOINT}" || ! -f "${TINY_CHECKPOINT}/model.safetensors" ) ]]; then
   echo "Set GLM53_TINY_CHECKPOINT to the normalized tiny checkpoint directory." >&2
@@ -404,7 +409,7 @@ COMMON_ARGS=(
   --seq-length 128
   --max-position-embeddings 128
   --use-dynamic-batch-size
-  --max-tokens-per-gpu 256
+  --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
   --optimizer adam
   --lr-decay-style constant
   --weight-decay 0.0
@@ -687,7 +692,7 @@ if [[ "${MODE}" = "rl" || "${MODE}" = "all" ]]; then
     --sglang-disable-overlap-schedule \
     --sglang-random-seed 1234 \
     --no-offload-train \
-    --no-offload-rollout \
+    "${ROLLOUT_OFFLOAD_ARGS[@]}" \
     --lr 1e-6
   "${PYTHON_BIN}" "${REPO_ROOT}/tools/verify_glm53_flash_tiny_export.py" \
     --source "${SFT_HF}" \
