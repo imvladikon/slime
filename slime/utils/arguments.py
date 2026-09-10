@@ -120,6 +120,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Extra environment variables for training process, e.g. PyTorch memory management ones.",
             )
             parser.add_argument(
+                "--disable-distributed-optimizer",
+                action="store_true",
+                help="Use the local optimizer for single-rank lifecycle diagnostics.",
+            )
+            parser.add_argument(
                 "--force-fp8-ue8m0-scale",
                 action="store_true",
                 default=False,
@@ -543,6 +548,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "buffer size for update weight, in bytes. "
                     "This is used for updating weights by chunk and should be useful for MoE models."
+                ),
+            )
+            parser.add_argument(
+                "--require-rank-local-expert-update",
+                action="store_true",
+                default=False,
+                help=(
+                    "Fail instead of falling back to full expert synchronization when the "
+                    "colocated Megatron/SGLang expert-routing plan cannot be built."
                 ),
             )
             parser.add_argument(
@@ -1325,6 +1339,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             reset_arg(parser, "--record-memory-history", action="store_true", default=False)
             parser.add_argument("--check-weight-update-equal", action="store_true")
+            parser.add_argument(
+                "--weight-checker-skip-prefix",
+                action="append",
+                default=[],
+                help="Skip a frozen SGLang parameter prefix during destructive weight-sync checks.",
+            )
+            parser.add_argument(
+                "--weight-checker-frozen-prefix",
+                action="append",
+                default=[],
+                help="Require this SGLang parameter prefix to keep the same checksum for the whole run.",
+            )
             return parser
 
         def add_network_arguments(parser):

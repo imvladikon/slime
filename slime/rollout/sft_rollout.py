@@ -1,11 +1,13 @@
 import logging
 
 from slime.utils.mask_utils import MultiTurnLossMaskGenerator
-from slime.utils.processing_utils import load_processor, load_tokenizer
+from slime.utils.processing_utils import build_processor_kwargs, load_processor, load_tokenizer
 
 __all__ = ["generate_rollout"]
 
 logger = logging.getLogger(__name__)
+
+_PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
 
 
 TOKENIZER = None
@@ -46,7 +48,36 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
         messages = sample.prompt
         tools = sample.metadata.get("tools", None)
 
-        token_ids, loss_mask = MASK_GENERATOR.get_loss_mask(messages, tools=tools)
+        raw_multimodal_inputs = sample.multimodal_inputs or {}
+        has_multimodal_inputs = PROCESSOR is not None and any(
+            value is not None for value in raw_multimodal_inputs.values()
+        )
+        if has_multimodal_inputs:
+            template_kwargs = dict(getattr(args, "apply_chat_template_kwargs", None) or {})
+            template_kwargs["add_generation_prompt"] = False
+            rendered = PROCESSOR.apply_chat_template(
+                messages,
+                tools=tools,
+                tokenize=False,
+                **template_kwargs,
+            )
+            processor_output = PROCESSOR(
+                text=rendered,
+                **build_processor_kwargs(raw_multimodal_inputs),
+            )
+            token_ids = list(processor_output["input_ids"][0])
+            sample.multimodal_train_inputs = {
+                key: value
+                for key, value in processor_output.items()
+                if key not in _PROCESSOR_PROMPT_KEYS
+            } or None
+            token_ids, loss_mask = MASK_GENERATOR.get_loss_mask_with_multimodal_alignment(
+                messages,
+                token_ids,
+                tools=tools,
+            )
+        else:
+            token_ids, loss_mask = MASK_GENERATOR.get_loss_mask(messages, tools=tools)
         if len(token_ids) != len(loss_mask):
             raise ValueError(
                 f"SFT rollout produced mismatched token_ids/loss_mask lengths: {len(token_ids)=}, {len(loss_mask)=}"

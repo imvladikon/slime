@@ -327,6 +327,7 @@ def test_loader_scope_stays_explicit():
         "glm4",
         "glm4_moe",
         "glm4_moe_lite",
+        "glm5_next",
         "glm_moe_dsa",
         "kimi_k2",
         "llama",

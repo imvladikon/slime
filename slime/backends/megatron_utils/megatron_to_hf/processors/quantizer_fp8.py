@@ -29,6 +29,15 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     else:
         layer_idx, rest = match.groups()
 
+    # GLM-5.3-Flash keeps kv_b and the complete DSA indexer in BF16 in the
+    # released FP8 checkpoint.  The generic DeepSeek path quantizes these
+    # Megatron module names, so decide from the already converted HF names
+    # before applying that family-wide rule.
+    converted_names = [name for name, _param in converted_named_params]
+    if any("model.language_model.layers." in name for name in converted_names):
+        if any(".self_attn.indexer." in name or name.endswith(".self_attn.kv_b_proj.weight") for name in converted_names):
+            return converted_named_params
+
     # experts
     expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
     match = re.match(expert_pattern, rest)

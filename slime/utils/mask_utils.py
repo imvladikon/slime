@@ -253,18 +253,24 @@ class MultiTurnLossMaskGenerator:
                         text_parts.append(item.get("text", ""))
                     elif isinstance(item, str):
                         text_parts.append(item)
-                text.append({"role": msg["role"], "content": " ".join(text_parts)})
+                text.append({**msg, "content": " ".join(text_parts)})
             else:
                 text.append(msg)
 
-        _, loss_mask_text = self.get_loss_mask(text, tools=tools)
-
-        diff = len(input_ids) - len(loss_mask_text)
-        assert diff >= 0, (
-            f"input_ids (length={len(input_ids)}) is shorter than text loss_mask (length={len(loss_mask_text)}) "
-            f"Please check if processor and tokenizer tokenization are consistent."
-        )
-        loss_mask = [0] * diff + loss_mask_text
+        text_ids, loss_mask_text = self.get_loss_mask(text, tools=tools)
+        loss_mask = []
+        text_index = 0
+        for token_id in input_ids:
+            if text_index < len(text_ids) and token_id == text_ids[text_index]:
+                loss_mask.append(loss_mask_text[text_index])
+                text_index += 1
+            else:
+                loss_mask.append(0)
+        if text_index != len(text_ids):
+            raise ValueError(
+                "Processor tokenization does not preserve the text-only token sequence: "
+                f"matched={text_index}, expected={len(text_ids)}, processed={len(input_ids)}"
+            )
 
         return input_ids, loss_mask
 

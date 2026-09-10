@@ -18,6 +18,31 @@ from slime.utils.memory_utils import clear_memory, print_memory
 logger = logging.getLogger(__name__)
 
 
+def _remove_expandable_segments_from_allocator_env() -> list[str]:
+    """Disable VMM allocations that cannot be exported through CUDA IPC."""
+    changed = []
+    for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        value = os.getenv(name)
+        if not value:
+            continue
+
+        options = [option.strip() for option in value.split(",") if option.strip()]
+        filtered = [
+            option
+            for option in options
+            if option.split(":", 1)[0].strip().lower() != "expandable_segments"
+        ]
+        if filtered == options:
+            continue
+
+        changed.append(name)
+        if filtered:
+            os.environ[name] = ",".join(filtered)
+        else:
+            os.environ.pop(name, None)
+    return changed
+
+
 def get_local_gpu_id():
     return accelerator.resolve_visible_device_id(ray.get_gpu_ids()[0])
 
@@ -52,13 +77,23 @@ class TrainRayActor(RayActor):
 
         torch.serialization.add_safe_globals([slime.utils.eval_config.EvalDatasetConfig])
 
+        if args.colocate:
+            changed_allocator_env = _remove_expandable_segments_from_allocator_env()
+            if changed_allocator_env:
+                logger.warning(
+                    "Removed expandable_segments from %s because colocated weight sync uses CUDA IPC",
+                    ", ".join(changed_allocator_env),
+                )
+
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         accelerator.set_device(local_rank)
-        if accelerator.set_allocator_expandable_segments():
+        if not args.colocate and accelerator.set_allocator_expandable_segments():
             logger.info(
                 f"[Rank {self._rank}] Enabled {accelerator.device_type().upper()} memory allocator "
                 "expandable_segments for train actor"
             )
+        elif args.colocate and os.getenv("SLIME_ENABLE_EXPANDABLE_SEGMENTS") == "1":
+            logger.warning("Ignoring SLIME_ENABLE_EXPANDABLE_SEGMENTS=1 because colocated weight sync uses CUDA IPC")
 
         backend = accelerator.process_group_backend(args.distributed_backend)
 

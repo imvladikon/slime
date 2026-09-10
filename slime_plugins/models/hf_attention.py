@@ -74,12 +74,16 @@ class HuggingfaceAttention(MegatronModule, ABC):
         layer_number: int,
         cp_comm_type: str = "p2p",
         pg_collection=None,
+        pp_layer_offset: int | None = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(config=config)
         self.args = args
         self.config = config
         # Note that megatron layer_number starts at 1
         self.layer_number = layer_number
+        self._pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
         self.hf_layer_idx = layer_number - 1
         self.hf_config = _load_hf_config(args.hf_checkpoint)
         # hardcode to fa2 at the moment.

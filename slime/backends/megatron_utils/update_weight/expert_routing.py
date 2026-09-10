@@ -198,14 +198,22 @@ def _set_expert_source_ranks(
     infos: Sequence[ParamInfo],
     local_names_by_rank: Sequence[Sequence[str]],
 ) -> list[ParamInfo]:
-    owners = {}
+    owners: dict[str, list[int]] = defaultdict(list)
     for rank, names in enumerate(local_names_by_rank):
         for name in names:
-            owners.setdefault(name, rank)
+            owners[name].append(rank)
     missing = [info.name for info in infos if info.name not in owners]
     if missing:
         raise ValueError(f"no physical owner for {missing[0]}")
-    return [replace(info, src_rank=owners[info.name]) for info in infos]
+
+    assigned_bytes: dict[int, int] = defaultdict(int)
+    selected: dict[str, int] = {}
+    for info in sorted(infos, key=lambda item: (-item.size, item.name)):
+        candidates = sorted(set(owners[info.name]))
+        source_rank = min(candidates, key=lambda rank: (assigned_bytes[rank], rank))
+        selected[info.name] = source_rank
+        assigned_bytes[source_rank] += info.size
+    return [replace(info, src_rank=selected[info.name]) for info in infos]
 
 
 def _resolve_expert_source_ranks(
@@ -288,8 +296,18 @@ def _pack_expert_transfer_batches(
 
 
 def _log_disabled_expert_routing(reason: str) -> None:
-    if dist.get_rank() == 0:
+    if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info("Disable rank-local expert update: %s", reason)
+
+
+def _disable_or_raise(
+    args: Namespace,
+    reason: str,
+) -> tuple[None, list[_ExpertTransferGroup]]:
+    if getattr(args, "require_rank_local_expert_update", False):
+        raise RuntimeError(f"rank-local expert update is required: {reason}")
+    _log_disabled_expert_routing(reason)
+    return None, []
 
 
 def configure_expert_routing(
@@ -303,14 +321,12 @@ def configure_expert_routing(
     use_distribute: bool,
 ) -> tuple[list[list[ParamInfo]] | None, list[_ExpertTransferGroup]]:
     if full_param_info_buckets is None:
-        return None, []
+        return _disable_or_raise(args, "parameter metadata is unavailable")
 
     if use_distribute:
-        _log_disabled_expert_routing("distributed SGLang engines are present")
-        return None, []
+        return _disable_or_raise(args, "distributed SGLang engines are present")
     if not engine_gpu_counts:
-        _log_disabled_expert_routing("no colocated SGLang engines")
-        return None, []
+        return _disable_or_raise(args, "no colocated SGLang engines")
 
     try:
         sglang_moe_topology = _get_homogeneous_sglang_moe_topology(
@@ -319,23 +335,21 @@ def configure_expert_routing(
             engine_parallel_configs,
         )
     except (AttributeError, TypeError, ValueError) as exc:
-        _log_disabled_expert_routing(str(exc))
-        return None, []
+        return _disable_or_raise(args, str(exc))
 
     if not _can_route_experts(
         args,
         sglang_moe_topology,
         engine_gpu_counts=engine_gpu_counts,
     ):
-        _log_disabled_expert_routing("SGLang/Megatron expert topology is not eligible")
-        return None, []
+        return _disable_or_raise(args, "SGLang/Megatron expert topology is not eligible")
     dense_infos = []
     expert_infos = []
     for bucket in full_param_info_buckets:
         for info in bucket:
             (expert_infos if _ROUTED_EXPERT.fullmatch(info.name) else dense_infos).append(info)
     if not expert_infos:
-        return None, []
+        return _disable_or_raise(args, "no routed-expert parameters were found")
 
     try:
         from megatron.core import mpu
@@ -360,8 +374,10 @@ def configure_expert_routing(
         expert_transfer_batches = sum(len(group) for group in expert_transfer_plan)
         dense_buckets = pack_param_info_buckets(dense_infos, buffer_size)
     except (AttributeError, TypeError, ValueError) as exc:
-        _log_disabled_expert_routing(str(exc))
-        return None, []
+        return _disable_or_raise(args, str(exc))
+
+    if not expert_transfer_plan:
+        return _disable_or_raise(args, "the routed-expert transfer plan is empty")
 
     if dist.get_rank() == 0:
         logger.info(

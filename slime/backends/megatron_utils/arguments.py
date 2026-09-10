@@ -149,8 +149,10 @@ def _hf_validate_args(args, hf_config):
 
 
 def _set_default_megatron_args(args):
-    # always use zero optimizer
-    args.use_distributed_optimizer = True
+    disable_distributed_optimizer = getattr(args, "disable_distributed_optimizer", False)
+    if disable_distributed_optimizer and args.world_size != 1:
+        raise ValueError("--disable-distributed-optimizer is only supported with a single training rank")
+    args.use_distributed_optimizer = not disable_distributed_optimizer
     if not hasattr(args, "enable_gloo_process_groups"):
         args.enable_gloo_process_groups = True
     # TODO: maybe change this after megatron has good fp8 support
