@@ -79,9 +79,19 @@ def test_glm53_training_remains_fail_closed_for_mtp_layers():
 def test_glm53_uses_current_megatron_fla_version():
     requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
     lock = (REPO_ROOT / "docker/glm53-flash.lock").read_text(encoding="utf-8")
+    kda = (REPO_ROOT / "slime_plugins/models/glm5_next/kda.py").read_text(encoding="utf-8")
+    cycle = (REPO_ROOT / "scripts/run-glm5.3-flash-tiny-cycle.sh").read_text(encoding="utf-8")
+    actor = (REPO_ROOT / "slime/backends/megatron_utils/actor.py").read_text(encoding="utf-8")
 
     assert "flash-linear-attention==0.5.1" in requirements
     assert "FLASH_LINEAR_ATTENTION_VERSION=0.5.1" in lock
+    assert "state_v_first=True" in kda
+    assert "transpose_state_layout=True" not in kda
+    assert cycle.count('"FLA_DISABLE_BACKEND_DISPATCH"') >= 2
+    assert cycle.count('"FLA_CONV_BACKEND"') >= 2
+    assert "fla_rank_environment_verified" in actor
+    assert '"FLA_DISABLE_BACKEND_DISPATCH": "1"' in actor
+    assert '"FLA_CONV_BACKEND": "triton"' in actor
 
 
 def test_full_profile_tracks_official_h200_serving_baseline():

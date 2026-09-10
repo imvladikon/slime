@@ -56,7 +56,7 @@ class Glm5NextKDA(nn.Module):
     ) -> None:
         super().__init__()
         if ShortConvolution is None or chunk_kda is None or FusedRMSNormGated is None:
-            raise ImportError("GLM-5.3 KDA requires flash-linear-attention >= 0.4.2")
+            raise ImportError("GLM-5.3 KDA requires flash-linear-attention == 0.5.1")
         tp_size = parallel_state.get_tensor_model_parallel_world_size() if config is not None else 1
         if num_heads % tp_size:
             raise ValueError(f"GLM-5.3 KDA heads={num_heads} must be divisible by TP={tp_size}")
@@ -181,7 +181,7 @@ class Glm5NextKDA(nn.Module):
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=cu_seqlens,
             safe_gate=True,
-            transpose_state_layout=True,
+            state_v_first=True,
         )
         norm_gate = self._linear(self.g_b_proj, gate_low_rank)
         output_shape = output.shape

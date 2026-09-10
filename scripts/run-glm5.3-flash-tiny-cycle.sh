@@ -204,6 +204,8 @@ print(json.dumps({
     "PYTHONPATH": os.environ["PYTHONPATH"],
     "PATH": os.environ["PATH"],
     "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+    "FLA_DISABLE_BACKEND_DISPATCH": os.environ["FLA_DISABLE_BACKEND_DISPATCH"],
+    "FLA_CONV_BACKEND": os.environ["FLA_CONV_BACKEND"],
 }))
 PY
 )
@@ -212,7 +214,16 @@ RUNTIME_ENV=$(
 import json
 import os
 
-keys = ("PYTHONPATH", "PATH", "LD_LIBRARY_PATH", "SGLANG_DSA_FUSE_TOPK", "SGLANG_CACHE_DIR", "RAY_USE_UVLOOP")
+keys = (
+    "PYTHONPATH",
+    "PATH",
+    "LD_LIBRARY_PATH",
+    "FLA_DISABLE_BACKEND_DISPATCH",
+    "FLA_CONV_BACKEND",
+    "SGLANG_DSA_FUSE_TOPK",
+    "SGLANG_CACHE_DIR",
+    "RAY_USE_UVLOOP",
+)
 print(json.dumps({"env_vars": {key: os.environ.get(key, "") for key in keys}}))
 PY
 )

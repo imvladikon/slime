@@ -53,6 +53,32 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _require_glm53_fla_environment(args: Namespace) -> None:
+    model_hooks = " ".join(
+        str(value)
+        for value in (
+            getattr(args, "spec", ""),
+            getattr(args, "custom_model_provider_path", ""),
+        )
+    )
+    if "glm5_next" not in model_hooks:
+        return
+    expected = {
+        "FLA_DISABLE_BACKEND_DISPATCH": "1",
+        "FLA_CONV_BACKEND": "triton",
+    }
+    actual = {name: os.environ.get(name) for name in expected}
+    if actual != expected:
+        raise RuntimeError(
+            f"Unsafe GLM-5.3-Flash FLA rank environment: {actual}, expected {expected}"
+        )
+    logger.info(
+        "GLM53_RUNTIME_EVENT fla_rank_environment_verified rank=%s "
+        "backend_dispatch=disabled conv_backend=triton",
+        os.environ.get("RANK", "unset"),
+    )
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
@@ -66,6 +92,10 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args = args
             return 0
 
+        # Fail before the custom GLM provider imports FLA. Ray runtime-env
+        # propagation must be explicit: SGLang also installs TileLang, which
+        # FLA 0.5.1 would otherwise select dynamically for KDA backward.
+        _require_glm53_fla_environment(args)
         monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
         # Destroying and recreating WORLD invalidates raw dist.group.WORLD references cached by external code.
