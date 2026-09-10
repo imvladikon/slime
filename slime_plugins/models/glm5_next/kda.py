@@ -189,6 +189,105 @@ class Glm5NextKDA(nn.Module):
         output = output.reshape(output_shape[0], output_shape[1], -1)
         return self._linear(self.o_proj, output)
 
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets=(), metadata=None):
+        """Describe the local TP shards for the distributed checkpoint.
+
+        Without this method MCore takes the generic path for a plain nn.Module:
+        a recursive state_dict plus an empty TP-axis map. Every tensor is then
+        written as replicated, so at TP>1 each rank claims to hold the whole
+        parameter and one of them arbitrarily wins. The checkpoint keeps 1/TP of
+        the weights and nothing reports an error. Marking the parameters with
+        `tensor_model_parallel` does not help: the generic helper never reads it.
+        """
+        from megatron.core.transformer.utils import (
+            ensure_metadata_has_dp_cp_group,
+            make_sharded_tensors_for_checkpoint,
+            sharded_state_dict_default,
+        )
+
+        # Both groups have to be passed together. The helpers fall back to
+        # parallel_state only when BOTH are None, so supplying one leaves the
+        # other as None and every rank along that axis reports replica 0. The
+        # checkpoint validator then rejects the access pattern — or worse, an
+        # unvalidated path keeps whichever rank wrote last.
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group = metadata["dp_cp_group"]
+        sharded = {}
+
+        # The projections already know their own layout — column-parallel shard
+        # axis 0, row-parallel axis 1 — so call their exporters, do not restate.
+        for name in ("q_proj", "k_proj", "v_proj", "b_proj", "f_b_proj", "g_b_proj", "o_proj",
+                     "f_a_proj", "g_a_proj", "o_norm"):
+            child = getattr(self, name)
+            sharded.update(
+                sharded_state_dict_default(
+                    child, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=tp_group
+                )
+            )
+
+        # One head partition per rank, so axis 0.
+        axis_map = {"A_log": 0, "dt_bias": 0} if self.tp_size > 1 else {}
+        sharded.update(
+            make_sharded_tensors_for_checkpoint(
+                {"A_log": self.A_log, "dt_bias": self.dt_bias},
+                prefix,
+                axis_map,
+                sharded_offsets,
+                tp_group=tp_group,
+                dp_cp_group=dp_cp_group,
+            )
+        )
+        sharded.update(self._sharded_conv1d(prefix, sharded_offsets, dp_cp_group))
+        return sharded
+
+    def _sharded_conv1d(self, prefix, sharded_offsets, dp_cp_group):
+        """The convolution is packed [Q | K | V] inside each rank.
+
+        Concatenating the rank-local tensors along axis 0 would give
+        [Q0 K0 V0 Q1 K1 V1], while the global weight is [Q.. K.. V..]. The three
+        sections are therefore described separately behind a leading section
+        axis; flattening the resulting (3, projection, kernel) global tensor
+        restores the intended order.
+        """
+        from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+
+        weight = self.conv1d.weight
+        key = f"{prefix}conv1d.weight"
+        if self.tp_size == 1:
+            return make_sharded_tensors_for_checkpoint(
+                {"conv1d.weight": weight},
+                prefix,
+                {},
+                sharded_offsets,
+                tp_group=parallel_state.get_tensor_model_parallel_group(),
+                dp_cp_group=dp_cp_group,
+            )
+
+        from megatron.core.dist_checkpointing.mapping import ShardedTensor
+        from megatron.core.utils import get_pg_rank
+
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        # The TP position is already carried by the offsets below, so only the
+        # data-parallel axis still has to separate the replicas.
+        replica_id = (0, 0, get_pg_rank(dp_cp_group))
+        rows = weight.shape[0] // 3
+        out = {}
+        for section in range(3):
+            # The section becomes a prepended axis so it does not collide with
+            # the TP split, which lives on axis 0 of the local piece. The global
+            # tensor is (3, projection, kernel).
+            out[f"{key}.section{section}"] = ShardedTensor.from_rank_offsets(
+                key,
+                weight[section * rows : (section + 1) * rows],
+                *sharded_offsets,
+                (0, section, 3),
+                (1, tp_rank, self.tp_size),
+                replica_id=replica_id,
+                prepend_axis_num=1,
+            )
+        return out
+
 
 class Glm5NextKDAAttention(HuggingfaceAttention):
     """Megatron attention adapter for a KDA decoder layer."""
