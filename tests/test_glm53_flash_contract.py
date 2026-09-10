@@ -76,6 +76,14 @@ def test_glm53_training_remains_fail_closed_for_mtp_layers():
     assert "training intentionally disables the released inference-only MTP layer" in source
 
 
+def test_glm53_uses_current_megatron_fla_version():
+    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    lock = (REPO_ROOT / "docker/glm53-flash.lock").read_text(encoding="utf-8")
+
+    assert "flash-linear-attention==0.5.1" in requirements
+    assert "FLASH_LINEAR_ATTENTION_VERSION=0.5.1" in lock
+
+
 def test_full_profile_tracks_official_h200_serving_baseline():
     script = (REPO_ROOT / "scripts/models/glm5.3-flash.sh").read_text(encoding="utf-8")
     required = {
