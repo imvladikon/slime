@@ -18,6 +18,14 @@ The sharded_state_dict under test is read out of the shipped kda.py rather than
 copied here, so the test cannot drift away from the code it guards. FSDP and the
 distributed checkpoint are real; only the module structure is a mirror, because
 constructing the real block needs the FLA kernels.
+
+An independent reading of the same layout exists in the open Megatron-Bridge
+GLM-5.3-Flash PR (NVIDIA-NeMo/Megatron-Bridge#6044), and it agrees where it
+overlaps: A_log and dt_bias shard on axis 0, f_a/g_a stay replicated while
+f_b/g_b shard, out_proj is row-parallel. Nothing from it is portable here — that
+bridge splits one HF decoder layer into two hybrid modules, while this plugin
+keeps a combined layer — but the agreement is worth recording, since the two
+were derived separately.
 """
 import os, sys, shutil
 import torch, torch.nn as nn
