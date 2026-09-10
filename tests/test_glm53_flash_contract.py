@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,56 @@ from slime_plugins.models.glm5_next.vision import _validate_glm5_next_runtime
 
 NUM_GPUS = 0
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _class_init(path: Path, class_name: str) -> ast.FunctionDef:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    class_node = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    return next(
+        node
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+
+
+def _forwards_keyword(init: ast.FunctionDef, keyword: str) -> bool:
+    return any(
+        item.arg == keyword
+        and isinstance(item.value, ast.Name)
+        and item.value.id == keyword
+        for call in ast.walk(init)
+        if isinstance(call, ast.Call)
+        for item in call.keywords
+    )
+
+
+def test_glm53_attention_adapters_match_current_mcore_mtp_abi():
+    base_init = _class_init(REPO_ROOT / "slime_plugins/models/hf_attention.py", "HuggingfaceAttention")
+    kda_init = _class_init(
+        REPO_ROOT / "slime_plugins/models/glm5_next/kda.py", "Glm5NextKDAAttention"
+    )
+    dsa_base_init = _class_init(
+        REPO_ROOT / "slime_plugins/models/glm5/glm5.py", "DSAMultiLatentAttention"
+    )
+
+    for init in (base_init, kda_init):
+        parameters = {argument.arg for argument in init.args.args}
+        assert {"is_mtp_layer", "pp_layer_offset"} <= parameters
+
+    assert _forwards_keyword(kda_init, "is_mtp_layer")
+    assert _forwards_keyword(kda_init, "pp_layer_offset")
+    assert _forwards_keyword(dsa_base_init, "is_mtp_layer")
+
+
+def test_glm53_training_remains_fail_closed_for_mtp_layers():
+    source = (
+        REPO_ROOT / "slime_plugins/models/glm5_next/glm5_next.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'getattr(config, "mtp_num_layers", None)' in source
+    assert "training intentionally disables the released inference-only MTP layer" in source
 
 
 def test_full_profile_tracks_official_h200_serving_baseline():

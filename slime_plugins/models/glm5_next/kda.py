@@ -201,12 +201,22 @@ class Glm5NextKDAAttention(HuggingfaceAttention):
         cp_comm_type: str = "p2p",
         model_comm_pgs=None,
         pg_collection=None,
+        pp_layer_offset: int | None = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
-        # ``model_comm_pgs`` and ``name`` are part of the current MCore
-        # attention-construction ABI.  This adapter does not consume them, but
-        # accepting them keeps the custom KDA layer buildable by ModuleSpec.
-        super().__init__(args, config, layer_number, cp_comm_type, pg_collection)
+        # These optional fields are part of the current MCore attention ABI.
+        # KDA does not branch on MTP, but preserving the marker and PP offset
+        # keeps construction and introspection equivalent to MCore Attention.
+        super().__init__(
+            args,
+            config,
+            layer_number,
+            cp_comm_type,
+            pg_collection,
+            pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
+        )
         text = get_text_config(self.hf_config)
         fields = _linear_attention_fields(text)
         device = torch.device("cpu") if config.use_cpu_initialization else torch.device("cuda", torch.cuda.current_device())

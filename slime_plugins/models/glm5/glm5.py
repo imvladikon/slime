@@ -327,6 +327,7 @@ class DSAMultiLatentAttention(Attention):
             attn_mask_type=attn_mask_type,
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
 
