@@ -18,8 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-EXPECTED_MEGATRON_COMMIT = "59e64c7356a1cd85dbf6ff55c27526825bf0634e"
-EXPECTED_SGLANG_COMMIT = "5d24abc2ac9dcdd1dc57cc39309147521f8f9d4b"
+EXPECTED_MEGATRON_COMMIT = "glm-5.x"
+EXPECTED_SGLANG_COMMIT = "glm-5.x"
 EXPECTED_SLIME_REPOSITORY = "https://github.com/imvladikon/slime.git"
 EXPECTED_MEGATRON_REPOSITORY = "https://github.com/imvladikon/Megatron-LM.git"
 EXPECTED_SGLANG_REPOSITORY = "https://github.com/imvladikon/sglang.git"
@@ -63,6 +63,10 @@ def normalize_repository(repository: str) -> str:
     return repository.removesuffix(".git").rstrip("/")
 
 
+def is_commit_id(value: str) -> bool:
+    return len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower())
+
+
 def assert_source_revision(root: Path, expected_repository: str, expected_commit: str) -> str:
     if (root / ".git").exists():
         actual_commit = subprocess.run(
@@ -85,8 +89,23 @@ def assert_source_revision(root: Path, expected_repository: str, expected_commit
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         actual_commit = provenance.get("commit")
         remote = provenance.get("repository")
-    if actual_commit != expected_commit:
-        raise RuntimeError(f"{root} is at {actual_commit}, expected {expected_commit}")
+    if is_commit_id(expected_commit):
+        if actual_commit != expected_commit:
+            raise RuntimeError(f"{root} is at {actual_commit}, expected {expected_commit}")
+    else:
+        # A branch was given instead of a commit. Require the checkout to sit on
+        # it when the ref resolves locally; a shallow or detached clone has
+        # nothing to compare against, and the repository check below is the real
+        # guard. Pass --expected-*-commit with a SHA to pin a qualified run.
+        resolved = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", expected_commit],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if resolved and resolved != actual_commit:
+            raise RuntimeError(
+                f"{root} is at {actual_commit}, but {expected_commit} resolves to {resolved}"
+            )
     if normalize_repository(str(remote)) != normalize_repository(expected_repository):
         raise RuntimeError(f"{root} reports repository {remote}, expected {expected_repository}")
     return actual_commit

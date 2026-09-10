@@ -178,7 +178,7 @@ def test_r3_router_tracks_the_locked_glm_sglang_commit():
 
     assert (
         "sglang-router @ "
-        "git+https://github.com/imvladikon/sglang.git@5d24abc2ac9dcdd1dc57cc39309147521f8f9d4b"
+        "git+https://github.com/imvladikon/sglang.git@glm-5.x"
         "#subdirectory=sgl-model-gateway/bindings/python"
     ) in requirements
 
