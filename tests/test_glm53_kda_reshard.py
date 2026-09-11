@@ -117,11 +117,25 @@ def build(kda_path, tp):
     return module
 
 
-def optimizer_state(module, sharded):
-    """Sharded optimizer state, built the way MCore builds it for a real run."""
+def optimizer_state(module, sharded, stamp=False):
+    """Sharded optimizer state, built the way MCore builds it for a real run.
+
+    With `stamp`, the convolution's Adam moments are overwritten with the same
+    row-tagged pattern as the weights (and twice it for the second moment), so
+    the load side can compare their values rather than count their keys. Moments
+    left as whatever one step produced would only ever show that something was
+    written there.
+    """
     optimizer = torch.optim.AdamW(list(module.parameters()), lr=1e-3)
     sum(param.float().pow(2).sum() for param in module.parameters()).backward()
     optimizer.step()
+    if stamp:
+        pattern = expected_conv(parallel_state.get_tensor_model_parallel_rank(),
+                                parallel_state.get_tensor_model_parallel_world_size())
+        state = optimizer.state[module.conv1d.weight]
+        with torch.no_grad():
+            state["exp_avg"].copy_(pattern.to(state["exp_avg"].dtype).cuda())
+            state["exp_avg_sq"].copy_((pattern * 2).to(state["exp_avg_sq"].dtype).cuda())
     id_map = get_param_id_to_sharded_param_map(sharded, module.parameters())
     order = [name for name, _ in module.named_parameters()]
     unmapped = [order[i] for i in range(len(order)) if i not in id_map]
@@ -157,7 +171,7 @@ def main():
         sharded = module.sharded_state_dict(prefix="")
         # The optimizer step has to happen before the pattern is written, or it
         # moves the very weights the comparison is about.
-        sharded.update(optimizer_state(module, sharded))
+        sharded.update(optimizer_state(module, sharded, stamp=True))
         with torch.no_grad():
             module.conv1d.weight.copy_(expected_conv(tp_rank, tp).to(module.conv1d.weight.dtype).cuda())
         dist_checkpointing.save(sharded, CKPT)
@@ -173,11 +187,38 @@ def main():
             raise SystemExit(
                 f"свёртка после решардинга не совпала.\nожидалось {want[:, 0].tolist()}\nполучено {got[:, 0].tolist()}"
             )
-        moments = [key for key in loaded if key.startswith("optimizer.") and "conv1d" in key]
+        moments = {key: value for key, value in loaded.items()
+                   if key.startswith("optimizer.") and "conv1d" in key}
         if len(moments) != 2:
-            raise SystemExit(f"состояние Adam для свёртки не восстановлено: {moments}")
+            raise SystemExit(f"состояние Adam для свёртки не восстановлено: {sorted(moments)}")
+        for key, value in moments.items():
+            factor = 2.0 if "exp_avg_sq" in key else 1.0
+            wanted = (want * factor).cuda()
+            got_moment = value.cuda() if torch.is_tensor(value) else value
+            if not torch.equal(got_moment.float(), wanted.float()):
+                raise SystemExit(
+                    f"момент {key} после решардинга не совпал.\n"
+                    f"ожидалось {wanted[:, 0].tolist()}\nполучено {got_moment[:, 0].tolist()}"
+                )
+
+        # Одного совпадения мало: после восстановления шаг оптимизатора должен
+        # идти дальше, а не падать на несовпадении форм или на пустом состоянии.
+        optimizer = torch.optim.AdamW(list(module.parameters()), lr=1e-3)
+        with torch.no_grad():
+            module.conv1d.weight.copy_(want.to(module.conv1d.weight.dtype).cuda())
+        state = optimizer.state[module.conv1d.weight]
+        state["step"] = torch.tensor(1.0)
+        state["exp_avg"] = moments[next(k for k in moments if "exp_avg_sq" not in k)].cuda().clone()
+        state["exp_avg_sq"] = moments[next(k for k in moments if "exp_avg_sq" in k)].cuda().clone()
+        sum(param.float().pow(2).sum() for param in module.parameters()).backward()
+        optimizer.step()
+        if not torch.isfinite(module.conv1d.weight).all():
+            raise SystemExit("шаг оптимизатора после загрузки дал нефинитные веса")
+        if torch.equal(module.conv1d.weight.float(), want.cuda().float()):
+            raise SystemExit("шаг оптимизатора после загрузки не изменил свёртку")
+
         if dist.get_rank() == 0:
-            print(f"загружено при TP={tp}: свёртка и моменты Adam совпали")
+            print(f"загружено при TP={tp}: свёртка, моменты Adam и следующий шаг сошлись")
 
     dist.barrier()
     parallel_state.destroy_model_parallel()
