@@ -245,48 +245,35 @@ class Glm5NextKDA(nn.Module):
         """The convolution is packed [Q | K | V] inside each rank.
 
         Concatenating the rank-local tensors along axis 0 would give
-        [Q0 K0 V0 Q1 K1 V1], while the global weight is [Q.. K.. V..]. The three
-        sections are therefore described separately behind a leading section
-        axis; flattening the resulting (3, projection, kernel) global tensor
-        restores the intended order.
+        [Q0 K0 V0 Q1 K1 V1] while the global weight is [Q.. K.. V..], so the
+        three sections have to be described separately. Slicing the parameter to
+        do that is what MCore's own SSM layers avoid: the optimizer state is
+        matched to the model by object identity (``id(ten.data)`` in
+        ``get_param_id_to_sharded_param_map``), and a slice is a new tensor, so
+        the convolution loses its Adam moments with nothing but a debug log.
+        Measured on real MCore at TP2: ``conv1d.weight`` unmapped.
+
+        ``_split_tensor_factory`` is the mechanism mamba and the gated delta net
+        already use for exactly this [q|k|v] packing. The factory keeps the
+        original ``Parameter`` as its data, so identity survives, and it splits
+        the local shard into named sections, so the checkpoint schema is the
+        same at every TP size instead of changing rank between TP1 and TP>1.
         """
+        from megatron.core.ssm.utils import _split_tensor_factory
         from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
-        weight = self.conv1d.weight
         key = f"{prefix}conv1d.weight"
-        if self.tp_size == 1:
-            return make_sharded_tensors_for_checkpoint(
-                {"conv1d.weight": weight},
-                prefix,
-                {},
-                sharded_offsets,
-                tp_group=parallel_state.get_tensor_model_parallel_group(),
-                dp_cp_group=dp_cp_group,
-            )
-
-        from megatron.core.dist_checkpointing.mapping import ShardedTensor
-        from megatron.core.utils import get_pg_rank
-
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        # The TP position is already carried by the offsets below, so only the
-        # data-parallel axis still has to separate the replicas.
-        replica_id = (0, 0, get_pg_rank(dp_cp_group))
-        rows = weight.shape[0] // 3
-        out = {}
-        for section in range(3):
-            # The section becomes a prepended axis so it does not collide with
-            # the TP split, which lives on axis 0 of the local piece. The global
-            # tensor is (3, projection, kernel).
-            out[f"{key}.section{section}"] = ShardedTensor.from_rank_offsets(
-                key,
-                weight[section * rows : (section + 1) * rows],
-                *sharded_offsets,
-                (0, section, 3),
-                (1, tp_rank, self.tp_size),
-                replica_id=replica_id,
-                prepend_axis_num=1,
-            )
-        return out
+        sharded = make_sharded_tensors_for_checkpoint(
+            {"conv1d.weight": self.conv1d.weight},
+            prefix,
+            {"conv1d.weight": 0},
+            sharded_offsets,
+            tp_group=parallel_state.get_tensor_model_parallel_group(),
+            dp_cp_group=dp_cp_group,
+        )
+        rows = self.conv1d.weight.shape[0] // 3
+        sharded[key] = _split_tensor_factory(sharded[key], [rows] * 3, ["query", "key", "value"], 0)
+        return sharded
 
 
 class Glm5NextKDAAttention(HuggingfaceAttention):
