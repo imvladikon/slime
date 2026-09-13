@@ -224,6 +224,15 @@ def _tiny_checkpoint() -> Path:
     return checkpoint
 
 
+@pytest.mark.parametrize("bad", ["linear_attenton", "full_attention"])
+def test_attention_schedules_reject_unknown_layer_types(bad):
+    text = SimpleNamespace(layer_types=["linear_attention", bad, "deepseek_sparse_attention"])
+    with pytest.raises(ValueError, match=bad):
+        attention_schedules(text)
+    text.layer_types[1] = "linear_attention"
+    assert attention_schedules(text) == ([0, 1], [2])
+
+
 def test_real_tiny_checkpoint_matches_hybrid_contract():
     checkpoint = _tiny_checkpoint()
 

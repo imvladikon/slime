@@ -55,6 +55,10 @@ def attention_schedules(text_config) -> tuple[list[int], list[int]]:
     """Return zero-based KDA and DSA layer indices from either supported schema."""
     linear = getattr(text_config, "linear_attn_config", None)
     layer_types = getattr(text_config, "layer_types", None)
+    if layer_types is not None:
+        unknown = sorted(set(layer_types) - {"linear_attention", "deepseek_sparse_attention"})
+        if unknown:
+            raise ValueError(f"GLM-5.3 layer_types has unsupported attention types: {unknown}")
     if isinstance(linear, SimpleNamespace):
         kda = getattr(linear, "kda_layers", None)
         dsa = getattr(linear, "full_attn_layers", None)
