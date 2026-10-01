@@ -46,7 +46,7 @@ def _checksum_frozen_weights(args, rollout_manager):
     if not prefixes or not args.check_weight_update_equal:
         return None
     responses = ray.get(
-        rollout_manager.check_weights.remote(action="checksum", skip_prefixes=[])
+        rollout_manager.check_weights.remote(action="checksum")
     )
     return _frozen_weight_fingerprint(responses, prefixes)
 
